@@ -207,7 +207,6 @@ async def run_new_key_setup_flow(
     owner_telegram_id: int | None = None,
     owner_username: str | None = None,
     server_id: int | None = None,
-    inbound_id: int | None = None,
     force_new: bool = False,
 ) -> NewKeySetupResult:
     """Render and execute one step using the same domain service for every source."""
@@ -221,7 +220,6 @@ async def run_new_key_setup_flow(
         order_id,
         expected_telegram_id=expected_telegram_id,
         server_id=server_id,
-        inbound_id=inbound_id,
     )
     await _update_state(
         state,
@@ -245,37 +243,6 @@ async def run_new_key_setup_flow(
                     result.servers,
                     callback_prefix=f"new_key_server:{result.order_id}",
                 ),
-            },
-            force_new=force_new,
-        )
-        if isinstance(target, BackgroundKeyFlowTarget) and rendered is None:
-            return replace(
-                result,
-                status=NewKeySetupStatus.RETRYABLE_FAILURE,
-                page_key="key_operation_failed",
-                error_code="selection_delivery_failed",
-            )
-        return result
-
-    if result.status is NewKeySetupStatus.AWAITING_INBOUND:
-        from bot.states.user_states import NewKeyConfig
-        from bot.utils.page_button_items import build_protocol_button_items
-
-        await _set_state(state, NewKeyConfig.waiting_for_inbound)
-        await _update_state(state, new_key_server_id=result.server_id)
-        rendered = await _render_key_flow_page(
-            target,
-            result.page_key or "new_key_inbound_select",
-            context={
-                **_base_context(result),
-                "protocol_button_items": build_protocol_button_items(
-                    result.inbounds,
-                    callback_prefix=(
-                        f"new_key_inbound:{result.order_id}:{result.server_id}"
-                    ),
-                ),
-                "key_flow_back_callback": f"new_key_back:{result.order_id}",
-                "selected_server_name": result.server_name,
             },
             force_new=force_new,
         )
@@ -426,25 +393,16 @@ def _parse_positive_int(value: str | None) -> int | None:
     return parsed if parsed > 0 else None
 
 
-async def _legacy_order_id(state: FSMContext) -> str | None:
-    data = await _state_data(state)
-    value = str(data.get("new_key_order_id") or "").strip()
-    return value or None
-
-
 @router.callback_query(F.data.startswith("new_key_server:"))
 async def process_new_key_server_selection(
     callback: CallbackQuery,
     state: FSMContext,
 ) -> None:
-    """Select a server using an order-bound callback or the legacy FSM payload."""
+    """Select a server using an order-bound callback."""
     parts = str(callback.data or "").split(":")
     if len(parts) == 3:
         order_id = parts[1]
         server_id = _parse_positive_int(parts[2])
-    elif len(parts) == 2:
-        order_id = await _legacy_order_id(state)
-        server_id = _parse_positive_int(parts[1])
     else:
         order_id = None
         server_id = None
@@ -466,116 +424,9 @@ async def process_new_key_server_selection(
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("new_key_inbound:"))
-async def process_new_key_inbound_selection(
-    callback: CallbackQuery,
-    state: FSMContext,
-) -> None:
-    """Select an inbound using an order-bound callback or legacy FSM state."""
-    parts = str(callback.data or "").split(":")
-    if len(parts) == 4:
-        order_id = parts[1]
-        server_id = _parse_positive_int(parts[2])
-        inbound_id = _parse_positive_int(parts[3])
-    elif len(parts) == 2:
-        data = await _state_data(state)
-        order_id = str(data.get("new_key_order_id") or "").strip() or None
-        server_id = _parse_positive_int(data.get("new_key_server_id"))
-        inbound_id = _parse_positive_int(parts[1])
-    else:
-        order_id = None
-        server_id = None
-        inbound_id = None
-    if not order_id or not server_id or not inbound_id:
-        await _render_key_flow_page(
-            callback,
-            "payment_order_unavailable",
-            context={"telegram_id": callback.from_user.id},
-        )
-        await callback.answer()
-        return
-    await run_new_key_setup_flow(
-        callback,
-        order_id,
-        state=state,
-        owner_telegram_id=callback.from_user.id,
-        server_id=server_id,
-        inbound_id=inbound_id,
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("new_key_back:"))
-@router.callback_query(F.data == "back_to_server_select")
-async def back_to_server_select(
-    callback: CallbackQuery,
-    state: FSMContext,
-) -> None:
-    """Return to the order-bound server selection step."""
-    if str(callback.data or "").startswith("new_key_back:"):
-        order_id = str(callback.data).split(":", 1)[1].strip() or None
-    else:
-        order_id = await _legacy_order_id(state)
-    if not order_id:
-        await _render_key_flow_page(
-            callback,
-            "payment_order_unavailable",
-            context={"telegram_id": callback.from_user.id},
-        )
-        await callback.answer()
-        return
-    await run_new_key_setup_flow(
-        callback,
-        order_id,
-        state=state,
-        owner_telegram_id=callback.from_user.id,
-    )
-    await callback.answer()
-
-
-async def process_new_key_subscription_final(
-    target: Any,
-    state: FSMContext,
-    server_id: int,
-) -> NewKeySetupResult:
-    """Legacy callable adapter; provisioning remains in the shared service."""
-    data = await _state_data(state)
-    order_id = str(data.get("new_key_order_id") or "").strip()
-    return await run_new_key_setup_flow(
-        target,
-        order_id,
-        state=state,
-        owner_telegram_id=data.get("new_key_owner_telegram_id"),
-        server_id=server_id,
-    )
-
-
-async def process_new_key_final(
-    target: Any,
-    state: FSMContext,
-    server_id: int,
-    inbound_id: int,
-) -> NewKeySetupResult:
-    """Legacy callable adapter; provisioning remains in the shared service."""
-    data = await _state_data(state)
-    order_id = str(data.get("new_key_order_id") or "").strip()
-    return await run_new_key_setup_flow(
-        target,
-        order_id,
-        state=state,
-        owner_telegram_id=data.get("new_key_owner_telegram_id"),
-        server_id=server_id,
-        inbound_id=inbound_id,
-    )
-
-
 __all__ = [
     "BackgroundKeyFlowTarget",
-    "back_to_server_select",
-    "process_new_key_final",
-    "process_new_key_inbound_selection",
     "process_new_key_server_selection",
-    "process_new_key_subscription_final",
     "run_new_key_setup_flow",
     "start_new_key_config",
     "start_new_key_config_background",

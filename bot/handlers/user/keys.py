@@ -1,7 +1,6 @@
 import logging
 import uuid
 import asyncio
-from datetime import datetime
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
 from aiogram.filters import Command, CommandObject, StateFilter
@@ -226,16 +225,12 @@ async def _execute_key_delete(request: CoreActionRequest) -> None:
     ):
         try:
             client = await get_client(key['server_id'])
-            if key.get('sub_id'):
-                # Subscription: delete all clients with this email on the server
-                deleted = await client.delete_clients_by_email_on_server(key['panel_email'])
-                logger.info(
-                    f"Subscription-ключ {key_id}: удалено {deleted} клиентов "
-                    f"с email {key['panel_email']} с сервера 3X-UI"
-                )
-            elif key.get('panel_inbound_id') and key.get('client_uuid'):
-                await client.delete_client(key['panel_inbound_id'], key['client_uuid'])
-                logger.info(f"Клиент {key.get('panel_email', 'unknown')} удален с сервера 3X-UI")
+            await client.delete_client(key['panel_email'])
+            logger.info(
+                "Logical client for key %s was deleted from server %s",
+                key_id,
+                key['server_id'],
+            )
         except Exception as e:
             logger.warning(f"Не удалось удалить клиента {key.get('panel_email', 'unknown')} с сервера 3X-UI: {e}")
     elif key.get('server_id'):
@@ -262,7 +257,7 @@ async def key_details_handler(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith('key_show:'))
 async def key_show_handler(callback: CallbackQuery):
-    """Show copy key (with QR and JSON)."""
+    """Show the subscription URL and QR code."""
     from database.requests import get_key_details_for_user
     from bot.utils.key_sender import build_key_delivery_target, send_key_with_qr
     key_id = int(callback.data.split(':')[1])
@@ -271,7 +266,7 @@ async def key_show_handler(callback: CallbackQuery):
     if not key:
         await _render_key_action_page(callback, 'key_not_found')
         return
-    if not key['client_uuid']:
+    if not all((key.get('server_id'), key.get('panel_email'), key.get('sub_id'))):
         from bot.utils.page_renderer import render_page
 
         await render_page(callback, page_key='key_show_unconfigured')
@@ -469,17 +464,16 @@ async def _execute_key_replace_or_configure(request: CoreActionRequest) -> None:
 
 @router.callback_query(ReplaceKey.users_server, F.data.startswith('replace_server:'))
 async def key_replace_server_handler(callback: CallbackQuery, state: FSMContext):
-    """Selecting a server to replace."""
+    """Validate the target server and proceed directly to confirmation."""
     from database.requests import get_server_by_id, get_key_details_for_user
     from bot.services.vpn_api import (
         get_client,
         get_client_inbound_descriptors,
         VPNAPIError,
-        is_subscription_mode,
     )
-    from bot.utils.page_button_items import build_protocol_button_items
     from bot.utils.key_pages import build_key_page_context
     from bot.utils.page_renderer import render_page
+
     server_id = int(callback.data.split(':')[1])
     server = get_server_by_id(server_id)
     if not server:
@@ -487,97 +481,29 @@ async def key_replace_server_handler(callback: CallbackQuery, state: FSMContext)
         await _render_key_action_page(callback, 'key_operation_unavailable')
         return
     await state.update_data(replace_server_id=server_id)
-
-    # Subscription mode: skip the inbound selection - confirmation immediately
-    if is_subscription_mode():
-        data = await state.get_data()
-        key_id = data.get('replace_key_id')
-        key = get_key_details_for_user(key_id, callback.from_user.id)
-        if not key:
-            await _render_key_action_page(callback, 'key_not_found')
-            return
-        # Minimum server test (we will receive inbounds later during execution)
-        try:
-            client = await get_client(server_id)
-            descriptors = await get_client_inbound_descriptors(
-                client,
-                subscription_mode=True,
-            )
-            if not descriptors:
-                await _render_key_action_page(callback, 'key_operation_unavailable', key=key)
-                return
-        except VPNAPIError as e:
-            logger.warning('Failed to inspect replacement server %s: %s', server_id, e)
-            await _render_key_action_page(callback, 'key_operation_failed', key=key)
-            return
-        await state.set_state(ReplaceKey.confirm)
-        await state.update_data(replace_inbound_id=None)
-        await render_page(
-            callback,
-            page_key='key_replace_confirm',
-            context={
-                'telegram_id': callback.from_user.id,
-                'key_id': key_id,
-                'key_flow_confirm_callback': 'replace_confirm',
-                'key_flow_back_callback': f'key:{key_id}',
-                'selected_server_name': server.get('name'),
-                **build_key_page_context(key),
-            },
-        )
-        await callback.answer()
+    data = await state.get_data()
+    key_id = data.get('replace_key_id')
+    key = get_key_details_for_user(key_id, callback.from_user.id)
+    if not key:
+        await _render_key_action_page(callback, 'key_not_found')
         return
-
     try:
         client = await get_client(server_id)
         descriptors = await get_client_inbound_descriptors(
             client,
-            subscription_mode=False,
         )
-        inbounds = [descriptor.as_inbound() for descriptor in descriptors]
-        if not inbounds:
-            await _render_key_action_page(callback, 'key_operation_unavailable')
+        if not any(descriptor.available for descriptor in descriptors):
+            await _render_key_action_page(
+                callback,
+                'key_operation_unavailable',
+                key=key,
+            )
             return
-        data = await state.get_data()
-        key_id = data.get('replace_key_id')
-        await state.set_state(ReplaceKey.users_inbound)
-        await render_page(
-            callback,
-            page_key='key_replace_inbound_select',
-            context={
-                'telegram_id': callback.from_user.id,
-                'key_id': key_id,
-                'protocol_button_items': build_protocol_button_items(
-                    inbounds,
-                    callback_prefix='replace_inbound',
-                ),
-                'key_flow_back_callback': f'key_replace:{key_id}',
-                'selected_server_name': server.get('name'),
-            },
-        )
     except VPNAPIError as e:
         logger.warning('Failed to inspect replacement server %s: %s', server_id, e)
-        await _render_key_action_page(callback, 'key_operation_failed')
+        await _render_key_action_page(callback, 'key_operation_failed', key=key)
         return
-    await callback.answer()
-
-@router.callback_query(ReplaceKey.users_inbound, F.data.startswith('replace_inbound:'))
-async def key_replace_inbound_handler(callback: CallbackQuery, state: FSMContext):
-    """Select inbound and confirm."""
-    from database.requests import get_server_by_id, get_key_details_for_user
-    from bot.utils.key_pages import build_key_page_context
-    from bot.utils.page_renderer import render_page
-    inbound_id = int(callback.data.split(':')[1])
-    await state.update_data(replace_inbound_id=inbound_id)
-    data = await state.get_data()
-    key_id = data.get('replace_key_id')
-    server_id = data.get('replace_server_id')
-    key = get_key_details_for_user(key_id, callback.from_user.id)
-    server = get_server_by_id(server_id)
     await state.set_state(ReplaceKey.confirm)
-    if not key or not server:
-        logger.warning('Replacement confirmation lost key or server state')
-        await _render_key_action_page(callback, 'key_operation_unavailable')
-        return
     await render_page(
         callback,
         page_key='key_replace_confirm',
@@ -595,8 +521,35 @@ async def key_replace_inbound_handler(callback: CallbackQuery, state: FSMContext
 @router.callback_query(ReplaceKey.confirm, F.data == 'replace_confirm')
 @regular_panel_operation
 async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
-    """Performing a key replacement."""
-    from database.requests import get_key_details_for_user, get_server_by_id, update_key_traffic, update_vpn_key_connection
+    """Serialize replacement attempts for one key owner."""
+    from bot.services.user_locks import user_locks
+    from database.requests import get_key_details_for_user
+
+    data = await state.get_data()
+    key_id = data.get('replace_key_id')
+    current_key = get_key_details_for_user(key_id, callback.from_user.id)
+    if not current_key:
+        logger.warning(
+            'Replacement state is stale before locking (user=%s, key=%s)',
+            callback.from_user.id,
+            key_id,
+        )
+        await _render_key_action_page(callback, 'key_operation_unavailable')
+        return
+
+    lock_id = int(current_key.get('user_id') or callback.from_user.id)
+    async with user_locks[lock_id]:
+        await _key_replace_execute_locked(callback, state)
+
+
+async def _key_replace_execute_locked(callback: CallbackQuery, state: FSMContext):
+    """Replace a logical subscription without risking the current binding."""
+    from database.requests import (
+        get_key_details_for_user,
+        get_server_by_id,
+        update_key_traffic,
+        update_vpn_key_binding,
+    )
     from bot.services.vpn_api import (
         calculate_panel_total_for_key,
         get_client,
@@ -605,15 +558,12 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
         get_key_traffic_snapshot,
         provision_client_on_server,
         VPNAPIError,
-        is_subscription_mode,
     )
     from bot.handlers.admin.users_keys import generate_unique_email
     from bot.utils.key_sender import build_key_delivery_target, send_key_with_qr
-    import uuid as _uuid
     data = await state.get_data()
     key_id = data.get('replace_key_id')
     new_server_id = data.get('replace_server_id')
-    new_inbound_id = data.get('replace_inbound_id')  # None in subscription
     telegram_id = callback.from_user.id
     current_key = get_key_details_for_user(key_id, telegram_id)
     new_server_data = get_server_by_id(new_server_id)
@@ -630,9 +580,9 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
     status_message = await _render_key_action_page(callback, 'key_progress', key=current_key)
     delivery_target = build_key_delivery_target(callback, status_message)
 
-    subscription_mode = is_subscription_mode()
-    old_had_sub = bool(current_key.get('sub_id'))
-    is_same_server = current_key.get('server_id') == new_server_id
+    candidate_email = None
+    candidate_client = None
+    binding_swapped = False
 
     try:
         traffic_limit = current_key.get('traffic_limit', 0) or 0
@@ -670,7 +620,7 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
                     )
         elif current_key.get('server_id') and current_key.get('server_active'):
             logger.warning(
-                "Key replacement skipped old panel client for key %s with "
+                "Key replacement skipped previous logical client for key %s with "
                 "unmanaged panel_email=%r",
                 key_id,
                 current_key.get('panel_email'),
@@ -684,7 +634,46 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
             )
             return
 
-        # === 2. Delete old ===
+        # === 2. Calculate the remaining entitlement ===
+        user_fake_dict = {'telegram_id': telegram_id, 'username': current_key.get('username')}
+        candidate_email = generate_unique_email(user_fake_dict)
+        remaining_bytes = (
+            calculate_panel_total_for_key(current_key, 0)
+            if traffic_limit > 0
+            else 0
+        )
+        exact_expiry_time_ms = get_key_expiry_time_ms(current_key)
+        limit_ip = get_key_limit_ip(current_key)
+
+        # === 3. Create the candidate before changing the database binding ===
+        candidate_sub_id = uuid.uuid4().hex
+        candidate_client = await get_client(new_server_id)
+        provisioned = await provision_client_on_server(
+            server_id=new_server_id,
+            email=candidate_email,
+            total_gb_bytes=remaining_bytes,
+            expiry_time_ms=exact_expiry_time_ms,
+            limit_ip=limit_ip,
+            enable=True,
+            tg_id=str(telegram_id),
+            sub_id=candidate_sub_id,
+            client=candidate_client,
+        )
+        candidate_sub_id = provisioned.sub_id
+        if not provisioned.attached_inbound_ids or not candidate_sub_id:
+            raise VPNAPIError('Панель не создала пригодную подписку')
+
+        # === 4. Atomically switch ownership in the database ===
+        if not update_vpn_key_binding(
+            key_id,
+            new_server_id,
+            candidate_email,
+            candidate_sub_id,
+        ):
+            raise VPNAPIError('Не удалось сохранить новую привязку ключа')
+        binding_swapped = True
+
+        # === 5. Remove the old logical client only after the DB switch ===
         if (
             current_key.get('server_id')
             and current_key.get('server_active')
@@ -693,109 +682,24 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
             try:
                 if old_client is None:
                     old_client = await get_client(current_key['server_id'])
-                if old_had_sub or subscription_mode:
-                    # We delete all clients with this email on the old server
-                    deleted = await old_client.delete_clients_by_email_on_server(current_key['panel_email'])
-                    logger.info(
-                        f"Старый ключ {key_id}: удалено {deleted} клиентов с email "
-                        f"{current_key['panel_email']} на сервере {current_key['server_id']}"
-                    )
-                else:
-                    await old_client.delete_client(current_key['panel_inbound_id'], current_key['client_uuid'])
-                    logger.info(f"Старый ключ {key_id} успешно удалён (uuid: {current_key['client_uuid']})")
-            except Exception as e:
-                error_msg = str(e)
-                logger.warning(f'Ошибка удаления старого ключа {key_id}: {error_msg}')
-                if is_same_server and not (old_had_sub or subscription_mode):
-                    if 'not found' in error_msg.lower() or 'не найден' in error_msg.lower() or 'no client remained' in error_msg.lower():
-                        logger.info('Ключ не найден на сервере, считаем удаленным.')
-                    else:
-                        raise VPNAPIError(f'Не удалось удалить старый ключ: {error_msg}. Замена отменена во избежание дублей.')
+                await old_client.delete_client(current_key['panel_email'])
+            except Exception:
+                logger.exception(
+                    'Old logical client cleanup failed after key replacement '
+                    '(key_id=%s, server_id=%s, email=%s)',
+                    key_id,
+                    current_key.get('server_id'),
+                    current_key.get('panel_email'),
+                )
 
-        # === 3. Counting balances ===
-        user_fake_dict = {'telegram_id': telegram_id, 'username': current_key.get('username')}
-        new_email = generate_unique_email(user_fake_dict)
-        if traffic_limit > 0:
-            remaining_bytes = calculate_panel_total_for_key(current_key, 0)
-            gb = 1024 ** 3
-            limit_gb = int((remaining_bytes + gb - 1) // gb) if remaining_bytes > 0 else 0
-        else:
-            remaining_bytes = 0
-            limit_gb = 0
-        if current_key.get('expires_at') is None:
-            days_left = 0
-        else:
-            expires_at = datetime.fromisoformat(current_key['expires_at'])
-            now = datetime.now()
-            delta = expires_at - now
-            days_left = delta.days
-            if delta.seconds > 0:
-                days_left += 1
-            if days_left < 1:
-                days_left = 1
-        exact_expiry_time_ms = get_key_expiry_time_ms(current_key)
-
-        limit_ip = get_key_limit_ip(current_key)
-
-        # === 4. Creating a new one ===
-        if subscription_mode:
-            new_sub_id = _uuid.uuid4().hex
-            provisioned = await provision_client_on_server(
-                server_id=new_server_id,
-                email=new_email,
-                total_gb=limit_gb,
-                total_gb_bytes=remaining_bytes,
-                expire_days=days_left,
-                expiry_time_ms=exact_expiry_time_ms,
-                limit_ip=limit_ip,
-                enable=True,
-                tg_id=str(telegram_id),
-                sub_id=new_sub_id,
-                subscription_mode=True,
-            )
-            first_inbound_id = provisioned.primary_inbound_id
-            first_uuid = provisioned.credential
-            created = len(provisioned.attached_inbound_ids)
-            if not first_uuid or first_inbound_id is None or created == 0:
-                raise RuntimeError('Не удалось создать ни одного клиента на новом сервере')
-            new_sub_id = provisioned.sub_id or new_sub_id
-            update_vpn_key_connection(
-                key_id=key_id, server_id=new_server_id,
-                panel_inbound_id=first_inbound_id, panel_email=new_email,
-                client_uuid=first_uuid, sub_id=new_sub_id,
-            )
-        else:
-            provisioned = await provision_client_on_server(
-                server_id=new_server_id,
-                email=new_email,
-                total_gb=limit_gb,
-                total_gb_bytes=remaining_bytes,
-                expire_days=days_left,
-                expiry_time_ms=exact_expiry_time_ms,
-                limit_ip=limit_ip,
-                enable=True,
-                tg_id=str(telegram_id),
-                subscription_mode=False,
-                inbound_ids=[new_inbound_id],
-            )
-            if provisioned.primary_inbound_id is None or not provisioned.credential:
-                raise RuntimeError('Не удалось создать клиента на выбранном inbound')
-            new_uuid = provisioned.credential
-            # Clear sub_id (now this is the keys-mode key)
-            update_vpn_key_connection(
-                key_id=key_id, server_id=new_server_id,
-                panel_inbound_id=new_inbound_id, panel_email=new_email,
-                client_uuid=new_uuid, sub_id=None,
-            )
-
-        # === 5. Traffic transfer ===
+        # === 6. Traffic transfer and partial-placement repair ===
         if traffic_limit > 0:
             logger.info(
                 f'Перенос трафика ключа {key_id}: остаток {remaining_bytes / 1024 ** 3:.1f} ГБ, '
                 f'полный тариф {traffic_limit / 1024 ** 3:.1f} ГБ, '
                 f'использовано {traffic_used / 1024 ** 3:.1f} ГБ'
             )
-        if subscription_mode and not provisioned.complete:
+        if not provisioned.complete:
             from bot.services.vpn_api import sync_key_to_panel_state
             sync_kwargs = (
                 {'panel_snapshot': provisioned.snapshot}
@@ -820,8 +724,6 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
                 'new_key': dict(updated_key or {}),
                 'old_server_id': current_key.get('server_id'),
                 'new_server_id': new_server_id,
-                'new_inbound_id': new_inbound_id,
-                'subscription_mode': subscription_mode,
                 'traffic_limit': traffic_limit,
                 'traffic_used': traffic_used,
                 'remaining_bytes': remaining_bytes,
@@ -829,7 +731,21 @@ async def key_replace_execute(callback: CallbackQuery, state: FSMContext):
         )
         await send_key_with_qr(delivery_target, updated_key, is_new=True)
     except Exception as e:
-        logger.error(f'Ошибка при замене ключа (user={callback.from_user.id}, key={key_id}): {e}')
+        if candidate_client is not None and candidate_email and not binding_swapped:
+            try:
+                await candidate_client.delete_client(candidate_email)
+            except Exception:
+                logger.exception(
+                    'Failed to clean replacement candidate key_id=%s email=%s',
+                    key_id,
+                    candidate_email,
+                )
+        logger.exception(
+            'Key replacement failed user=%s key_id=%s: %s',
+            callback.from_user.id,
+            key_id,
+            e,
+        )
         await _render_key_action_page(delivery_target, 'key_operation_failed', key=current_key)
 
 @router.callback_query(F.data.startswith('key_rename:'))

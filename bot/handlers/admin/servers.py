@@ -10,6 +10,7 @@ Processes:
 - Removal
 """
 import logging
+import datetime
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
@@ -20,7 +21,6 @@ from database.requests import (
     get_all_servers,
     get_server_by_id,
     add_server,
-    update_server_field,
     delete_server,
     toggle_server_active,
     get_groups_count,
@@ -102,7 +102,8 @@ async def render_server_view(message: Message, server_id: int, state: FSMContext
         f"🔐 Подключение: <b>{'API-ключ' if auth_method == AUTH_API_TOKEN else 'Логин и пароль'}</b>",
     ]
     if auth_method == AUTH_API_TOKEN:
-        lines.append("🔑 API-ключ: <code>сохранён</code>\n")
+        token_status = "сохранён" if server.get('api_token') else "не сохранён"
+        lines.append(f"🔑 API-ключ: <code>{token_status}</code>\n")
     else:
         password_masked = "•" * min(len(server.get('password') or ''), 8)
         lines.extend([
@@ -113,7 +114,6 @@ async def render_server_view(message: Message, server_id: int, state: FSMContext
     lines.extend([
         f"🧩 <b>3x-ui API:</b>",
         f"   Версия: <code>{escape_html(server.get('panel_version') or 'не определена')}</code>",
-        f"   Профиль: <code>{escape_html(server.get('panel_api_profile') or 'не определён')}</code>",
         f"   Проверка: <code>{escape_html(server.get('panel_checked_at') or 'ещё не выполнялась')}</code>\n",
         f"📊 <b>Статистика:</b>",
         f"   {status_emoji} Статус: {status_text}",
@@ -255,9 +255,7 @@ def get_server_auth_method(server: dict) -> str:
         str(server.get('login') or '').strip()
         and str(server.get('password') or '').strip()
     )
-    if server.get('api_token') and not has_credentials:
-        return AUTH_API_TOKEN
-    return AUTH_LOGIN_PASSWORD
+    return AUTH_LOGIN_PASSWORD if has_credentials else AUTH_API_TOKEN
 
 
 def _get_add_states(auth_method: str) -> list:
@@ -311,8 +309,9 @@ async def render_add_auth_method(message: Message, state: FSMContext, *, reset: 
         "🔑 <b>API-ключ</b> — рекомендуемый вариант для 3X-UI 3.3.0 и новее. "
         "Бот работает без входа в аккаунт панели, поэтому в панели можно оставить "
         "включённой двухфакторную аутентификацию.\n\n"
-        "👤 <b>Логин и пароль</b> — вариант для старых панелей. При включённой "
-        "двухфакторной аутентификации автоматический вход по логину и паролю не работает.\n\n"
+        "👤 <b>Логин и пароль</b> — бот входит в 3X-UI только для получения и "
+        "восстановления собственного API-ключа. Обычные операции всё равно идут через Bearer API. "
+        "При включённой двухфакторной аутентификации этот способ не работает.\n\n"
         "Выберите способ подключения:",
         reply_markup=add_server_auth_method_kb(),
     )
@@ -564,20 +563,8 @@ async def process_add_step(message: Message, state: FSMContext):
             )
             kb = add_server_confirm_kb()
         else:
-            retry_hint = (
-                "Проверьте URL и API-ключ. Сервер можно сохранить только после "
-                "успешной проверки."
-                if auth_method == AUTH_API_TOKEN
-                else "Проверьте введённые данные или сохраните сервер для настройки позже."
-            )
-            text = (
-                f"❌ <b>Ошибка подключения</b>\n\n"
-                f"<code>{escape_html(test_result['message'])}</code>\n\n"
-                f"{retry_hint}"
-            )
-            kb = add_server_test_failed_kb(
-                allow_save_anyway=auth_method != AUTH_API_TOKEN,
-            )
+            text = "❌ <b>Не удалось подключиться к панели</b>"
+            kb = add_server_test_failed_kb()
         
         await safe_edit_or_send(message, text, reply_markup=kb, force_new=True)
 
@@ -642,20 +629,8 @@ async def add_server_retest(callback: CallbackQuery, state: FSMContext):
         )
         kb = add_server_confirm_kb()
     else:
-        retry_hint = (
-            "Проверьте URL и API-ключ. Сервер можно сохранить только после "
-            "успешной проверки."
-            if auth_method == AUTH_API_TOKEN
-            else "Проверьте введённые данные или сохраните сервер для настройки позже."
-        )
-        text = (
-            f"❌ <b>Ошибка подключения</b>\n\n"
-            f"<code>{escape_html(test_result['message'])}</code>\n\n"
-            f"{retry_hint}"
-        )
-        kb = add_server_test_failed_kb(
-            allow_save_anyway=auth_method != AUTH_API_TOKEN,
-        )
+        text = "❌ <b>Не удалось подключиться к панели</b>"
+        kb = add_server_test_failed_kb()
     
     await safe_edit_or_send(callback.message, text, reply_markup=kb)
     await callback.answer()
@@ -672,9 +647,9 @@ async def add_server_save(callback: CallbackQuery, state: FSMContext):
     server_data = data.get('server_data', {})
     auth_method = data.get('auth_method', AUTH_LOGIN_PASSWORD)
 
-    if auth_method == AUTH_API_TOKEN and not data.get('connection_test_passed'):
+    if not data.get('connection_test_passed'):
         await callback.answer(
-            "❌ Сначала успешно проверьте API-ключ",
+            "❌ Сначала успешно проверьте подключение",
             show_alert=True,
         )
         return
@@ -691,7 +666,6 @@ async def add_server_save(callback: CallbackQuery, state: FSMContext):
             group_id=data.get('selected_group_id', 1),
             api_token=server_data.get('api_token'),
             panel_version=server_data.get('panel_version'),
-            panel_api_profile=server_data.get('panel_api_profile'),
         )
         
         await safe_edit_or_send(callback.message, 
@@ -857,6 +831,12 @@ async def edit_server_value(message: Message, state: FSMContext):
         )
         return
     
+    server = get_server_by_id(server_id)
+    if not server:
+        await safe_edit_or_send(message, "❌ Сервер не найден")
+        return
+
+    updates = {}
     if param['key'] == 'panel_url':
         url_str = value
         if not url_str.startswith(('http://', 'https://')):
@@ -877,19 +857,36 @@ async def edit_server_value(message: Message, state: FSMContext):
             if not path.endswith('/'):
                 path += '/'
                 
-            # We save all 4 parameters in the database
-            update_server_field(server_id, 'protocol', protocol)
-            update_server_field(server_id, 'host', host)
-            update_server_field(server_id, 'port', port)
-            success = update_server_field(server_id, 'web_base_path', path)
+            updates.update({
+                'protocol': protocol,
+                'host': host,
+                'port': port,
+                'web_base_path': path,
+            })
         except Exception as e:
             await safe_edit_or_send(message,
                 "❌ Неверный формат ссылки. Убедитесь, что указан хост и по умолчанию подставляется <code>https://</code>.\nПример: <code>123.45.67.89:2053/api/</code>"
             )
             return
-    elif param['key'] == 'api_token':
-        candidate = dict(get_server_by_id(server_id) or {})
-        candidate['api_token'] = value
+    else:
+        if 'convert' in param:
+            value = param['convert'](value)
+        updates[param['key']] = value
+
+    connection_fields = {'panel_url', 'api_token', 'login', 'password'}
+    if param['key'] in connection_fields:
+        candidate = dict(server)
+        candidate['id'] = None
+        candidate.update(updates)
+
+        # Validate the supplied authentication material itself. A previously
+        # valid Bearer must not conceal an invalid replacement password.
+        if param['key'] in {'login', 'password'}:
+            candidate['api_token'] = None
+        elif param['key'] == 'api_token':
+            candidate['login'] = ''
+            candidate['password'] = ''
+
         try:
             await message.delete()
         except Exception:
@@ -899,9 +896,7 @@ async def edit_server_value(message: Message, state: FSMContext):
         if not test_result['success']:
             await safe_edit_or_send(
                 message,
-                "❌ <b>API-ключ не сохранён</b>\n\n"
-                f"<code>{escape_html(test_result['message'])}</code>\n\n"
-                "Проверьте токен и повторите ввод.",
+                "❌ <b>Не удалось подключиться к панели</b>",
                 reply_markup=edit_server_kb(
                     current_param,
                     get_total_params(auth_method),
@@ -910,14 +905,16 @@ async def edit_server_value(message: Message, state: FSMContext):
             )
             return
 
-        success = update_server_field(server_id, 'api_token', value)
-    else:
-        # Conversion
-        if 'convert' in param:
-            value = param['convert'](value)
-        
-        # Saving in the database
-        success = update_server_field(server_id, param['key'], value)
+        updates['api_token'] = candidate.get('api_token')
+        updates['panel_version'] = candidate.get('panel_version')
+        updates['panel_checked_at'] = (
+            datetime.datetime.now(datetime.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace('+00:00', 'Z')
+        )
+
+    success = update_server(server_id, **updates)
     
     if not success:
         await safe_edit_or_send(message, "❌ Ошибка сохранения")

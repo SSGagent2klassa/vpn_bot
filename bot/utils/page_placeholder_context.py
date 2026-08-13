@@ -183,9 +183,7 @@ def _add_legacy_composite_page_context(
 
     fragment_specs = {
         'key_replace_server_select': ('screen_data_html', 1, -1),
-        'key_replace_inbound_select': ('screen_data_html', 1, -1),
         'new_key_server_select': ('screen_data_html', 1, None),
-        'new_key_inbound_select': ('screen_data_html', 1, -1),
         'key_replace_confirm': ('key_replace_data_html', 1, -1),
         'key_rename_prompt': ('key_rename_data_html', 1, 2),
     }

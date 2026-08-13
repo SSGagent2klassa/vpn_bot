@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 PAYMENT_TYPE_LABELS: Dict[str, str] = {
     'stars': '⭐ Telegram Stars',
     'crypto': '💰 Крипто (USDT)',
+    'cryptobot': '💎 CryptoBot',
     'cards': '💳 TG payments',
     'yookassa_qr': '📱 ЮКасса',
     'wata': '🌊 WATA',

@@ -1236,13 +1236,7 @@ async def sync_traffic_stats(
                 telegram_id = key.get('telegram_id')
                 if telegram_id:
                     # Forming the key name
-                    if key.get('custom_name'):
-                        keyname = key['custom_name']
-                    elif key.get('client_uuid'):
-                        uuid = key['client_uuid']
-                        keyname = f"{uuid[:4]}...{uuid[-4:]}" if len(uuid) >= 8 else uuid
-                    else:
-                        keyname = f"#{key['id']}"
+                    keyname = key.get('custom_name') or f"#{key['id']}"
                     
                     from bot.utils.event_placeholders import build_user_event_context, render_event_placeholders
 
@@ -1355,7 +1349,7 @@ async def run_traffic_sync_scheduler(bot: Bot) -> None:
     Background task to synchronize traffic every 5 minutes.
     Every 6 cycles (≈30 min) additionally causes
     materialize_subscription_state() to fit clients on panels
-    under the current bot_mode.
+    under the subscription-only contract.
 
     Args:
         bot: Bot instance

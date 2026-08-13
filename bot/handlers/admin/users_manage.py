@@ -12,7 +12,7 @@ from bot.utils.datetime_format import format_datetime_for_display
 from bot.utils.text import escape_html, safe_edit_or_send
 from bot.utils.panel_email import get_panel_email_prefix
 from bot.states.admin_states import AdminStates
-from bot.keyboards.admin import users_menu_kb, users_list_kb, user_view_kb, user_ban_confirm_kb, key_view_kb, add_key_server_kb, add_key_inbound_kb, add_key_step_kb, add_key_confirm_kb, users_input_cancel_kb, key_action_cancel_kb, back_and_home_kb, home_only_kb
+from bot.keyboards.admin import users_menu_kb, users_list_kb, user_view_kb, user_ban_confirm_kb, key_view_kb, add_key_server_kb, add_key_step_kb, add_key_confirm_kb, users_input_cancel_kb, key_action_cancel_kb, back_and_home_kb, home_only_kb
 from bot.services.key_lifecycle import sync_user_keys_panel_access
 from bot.services.vpn_api import get_client_from_server_data, VPNAPIError, format_traffic
 from bot.services.panel_sync_coordinator import regular_panel_operation
@@ -100,14 +100,7 @@ def _format_user_card(user: dict) -> tuple[str, any]:
     if vpn_keys:
         lines.append(f'🔑 <b>VPN-ключи ({len(vpn_keys)}):</b>')
         for key in vpn_keys:
-            if key.get('custom_name'):
-                key_name = key['custom_name']
-            else:
-                uuid = key.get('client_uuid') or ''
-                if len(uuid) >= 8:
-                    key_name = f'{uuid[:4]}...{uuid[-4:]}'
-                else:
-                    key_name = uuid or f"Ключ #{key['id']}"
+            key_name = key.get('custom_name') or f"Ключ #{key['id']}"
             raw_expires = key.get('expires_at')
             try:
                 expires_dt = datetime.fromisoformat(str(raw_expires).replace('Z', '+00:00'))

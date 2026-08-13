@@ -71,24 +71,6 @@ def build_server_button_items(
     ]
 
 
-def build_protocol_button_items(
-    inbounds: Iterable[Mapping[str, Any]],
-    *,
-    callback_prefix: str,
-) -> list[dict[str, Any]]:
-    """Return protocol business data and technical callbacks."""
-    return [
-        {
-            'callback_data': f"{callback_prefix}:{int(inbound['id'])}",
-            'data': {
-                'item_name': str(inbound.get('remark') or 'VPN'),
-                'item_protocol': str(inbound.get('protocol') or 'vless').upper(),
-            },
-        }
-        for inbound in inbounds
-    ]
-
-
 def build_key_button_items(keys: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Return key data/actions with statuses from the cached UI catalog."""
     items: list[dict[str, Any]] = []
@@ -118,7 +100,6 @@ def build_key_button_items(keys: Iterable[Mapping[str, Any]]) -> list[dict[str, 
 
 __all__ = [
     'build_key_button_items',
-    'build_protocol_button_items',
     'build_server_button_items',
     'build_tariff_button_items',
 ]

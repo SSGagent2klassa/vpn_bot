@@ -32,7 +32,6 @@ def delete_expired_keys_older_than(
                 vk.id,
                 vk.user_id,
                 vk.custom_name,
-                vk.client_uuid,
                 vk.panel_email,
                 vk.expires_at,
                 u.telegram_id

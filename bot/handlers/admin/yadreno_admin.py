@@ -47,10 +47,12 @@ from bot.services.yadreno_admin import (
     fetch_latest_dialog_event,
     get_active_request_id,
     is_local_request_active,
+    normalize_yadreno_admin_api_key,
     run_dialog,
     run_dialog_with_uploads,
     resume_active_dialog,
     start_new_chat,
+    yadreno_admin_message_storage_format,
 )
 from bot.states.admin_states import AdminStates
 from bot.utils.admin import is_admin
@@ -111,14 +113,51 @@ _yadreno_album_buffers: dict[tuple[int, int, str], _YadrenoAlbumBuffer] = {}
 _yadreno_album_locks: dict[tuple[int, int, str], asyncio.Lock] = {}
 
 
-def _yadreno_request_error_keyboard(admin_id: int, topic_id: int):
+def _yadreno_request_error_keyboard(
+    admin_id: int,
+    topic_id: int,
+    error: YadrenoAdminError | None = None,
+):
     """Return controls matching the persisted state after a failed turn."""
     return yadreno_admin_request_error_kb(
         topic_id,
         active_request=(
             get_active_request_id(admin_id, topic_id=topic_id) is not None
         ),
+        configuration_error=(
+            error is not None and error.kind == "configuration"
+        ),
+        show_api_key_action=(
+            error is None
+            or error.kind not in {
+                "maintenance",
+                "service_unavailable",
+                "transport",
+                "protocol",
+            }
+        ),
     )
+
+
+async def _show_yadreno_callback_error(
+    callback: CallbackQuery,
+    error: YadrenoAdminError,
+    topic_id: int,
+) -> None:
+    """Render actionable configuration failures instead of hiding them in alerts."""
+    if error.kind == "configuration":
+        await safe_edit_or_send(
+            callback.message,
+            format_yadreno_admin_error(error),
+            reply_markup=_yadreno_request_error_keyboard(
+                callback.from_user.id,
+                topic_id,
+                error,
+            ),
+        )
+        await callback.answer()
+        return
+    await callback.answer(yadreno_admin_error_alert(error), show_alert=True)
 
 
 def _missing_key_text() -> str:
@@ -484,7 +523,7 @@ async def start_yadreno_new_chat(callback: CallbackQuery, state: FSMContext):
             topic_id=topic_id,
         )
     except YadrenoAdminError as e:
-        await callback.answer(yadreno_admin_error_alert(e), show_alert=True)
+        await _show_yadreno_callback_error(callback, e, topic_id)
         return
 
     if result.status == "busy":
@@ -531,7 +570,7 @@ async def cancel_yadreno_dialog_button(callback: CallbackQuery):
             topic_id=topic_id,
         )
     except YadrenoAdminError as e:
-        await callback.answer(yadreno_admin_error_alert(e), show_alert=True)
+        await _show_yadreno_callback_error(callback, e, topic_id)
         return
 
     if cancel_result.status == "idle":
@@ -600,7 +639,7 @@ async def nudge_yadreno_dialog(callback: CallbackQuery):
             topic_id=topic_id,
         )
     except YadrenoAdminError as e:
-        await callback.answer(yadreno_admin_error_alert(e), show_alert=True)
+        await _show_yadreno_callback_error(callback, e, topic_id)
         return
 
     if latest is None:
@@ -642,6 +681,7 @@ async def nudge_yadreno_dialog(callback: CallbackQuery):
                     reply_markup=_yadreno_request_error_keyboard(
                         callback.from_user.id,
                         topic_id,
+                        e,
                     ),
                 )
                 return
@@ -687,6 +727,7 @@ async def nudge_yadreno_dialog(callback: CallbackQuery):
                 reply_markup=_yadreno_request_error_keyboard(
                     callback.from_user.id,
                     topic_id,
+                    e,
                 ),
             )
             return
@@ -741,15 +782,11 @@ async def save_yadreno_key(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
 
-    api_key = get_message_text_for_storage(message, 'plain')
-    if not api_key:
-        await safe_edit_or_send(
-            message,
-            "❌ <b>Ключ пустой</b>\n\nОтправьте непустой <code>api_key</code>.",
-            reply_markup=yadreno_admin_cancel_key_kb(),
-            force_new=True,
-        )
-        return
+    raw_api_key = get_message_text_for_storage(message, 'plain')
+    try:
+        api_key = normalize_yadreno_admin_api_key(raw_api_key)
+    except ValueError:
+        api_key = None
 
     data = await state.get_data()
     editing_message = data.get('yadreno_editing_message')
@@ -758,6 +795,19 @@ async def save_yadreno_key(message: Message, state: FSMContext):
         await message.delete()
     except Exception:
         pass
+
+    if api_key is None:
+        await safe_edit_or_send(
+            editing_message or message,
+            "❌ <b>Ключ Yadreno Admin повреждён</b>\n\n"
+            "В значении есть перенос строки, пробел или другой недопустимый "
+            "символ.\n\n"
+            "Отправьте только сам <code>api_key</code> одной строкой — без "
+            "кавычек, подписи и пояснений.",
+            reply_markup=yadreno_admin_cancel_key_kb(),
+            force_new=editing_message is None,
+        )
+        return
 
     set_yadreno_admin_api_key(api_key)
     server_ip = await detect_public_server_ip(use_cache=False)
@@ -805,7 +855,23 @@ async def cancel_yadreno_dialog(message: Message, state: FSMContext):
     except YadrenoAdminError as e:
         await safe_edit_or_send(
             message,
-            format_yadreno_admin_error(e, title="Не удалось отменить запрос"),
+            format_yadreno_admin_error(
+                e,
+                title=(
+                    None
+                    if e.kind == "configuration"
+                    else "Не удалось отменить запрос"
+                ),
+            ),
+            reply_markup=(
+                _yadreno_request_error_keyboard(
+                    message.from_user.id,
+                    topic_id,
+                    e,
+                )
+                if e.kind == "configuration"
+                else None
+            ),
             force_new=True,
         )
         return
@@ -848,7 +914,7 @@ async def handle_yadreno_chat_message(message: Message, state: FSMContext):
         )
         return
 
-    text = get_message_text_for_storage(message, 'plain')
+    text = _message_prompt_text(message, topic_id)
     thinking = await safe_edit_or_send(
         message,
         "🤖 <b>Yadreno Admin</b>\n\n⏳ Думаю...",
@@ -891,6 +957,7 @@ async def handle_yadreno_chat_message(message: Message, state: FSMContext):
             reply_markup=_yadreno_request_error_keyboard(
                 message.from_user.id,
                 topic_id,
+                e,
             ),
         )
 
@@ -1320,14 +1387,24 @@ def _yadreno_album_lock(key: tuple[int, int, str]) -> asyncio.Lock:
     return lock
 
 
-def _message_prompt_text(message: Message) -> str:
-    """Return plain prompt/caption from a Telegram message."""
-    return get_message_text_for_storage(message, "plain").strip()
+def _message_prompt_text(message: Message, topic_id: int) -> str:
+    """Return the topic-appropriate prompt or caption from Telegram."""
+    return get_message_text_for_storage(
+        message,
+        yadreno_admin_message_storage_format(topic_id),
+    ).strip()
 
 
-def _build_yadreno_album_prompt(messages: list[Message]) -> str:
+def _build_yadreno_album_prompt(messages: list[Message], topic_id: int) -> str:
     """Build one agent prompt from a Telegram media group."""
-    prompt = next((text for msg in messages if (text := _message_prompt_text(msg))), "")
+    prompt = next(
+        (
+            text
+            for msg in messages
+            if (text := _message_prompt_text(msg, topic_id))
+        ),
+        "",
+    )
     if not prompt:
         prompt = "Проанализируй приложенные изображения и файлы."
         if all(_is_metadata_only_media(msg) for msg in messages):
@@ -1395,7 +1472,7 @@ async def _flush_yadreno_album_after_delay(key: tuple[int, int, str]) -> None:
 
 async def _process_yadreno_album_buffer(buffer: _YadrenoAlbumBuffer) -> None:
     """Download uploadable album files and run one Yadreno Admin request."""
-    prompt = _build_yadreno_album_prompt(buffer.messages)
+    prompt = _build_yadreno_album_prompt(buffer.messages, buffer.topic_id)
     bound_page, bound_page_before = _capture_bound_yaa_page_state(
         buffer.user_id,
         buffer.topic_id,
@@ -1483,6 +1560,7 @@ async def _process_yadreno_album_buffer(buffer: _YadrenoAlbumBuffer) -> None:
             reply_markup=_yadreno_request_error_keyboard(
                 buffer.user_id,
                 buffer.topic_id,
+                e,
             ),
         )
     finally:
@@ -1541,7 +1619,15 @@ async def _handle_broadcast_yaa(
         await safe_edit_or_send(
             message,
             format_yadreno_admin_error(error),
-            reply_markup=broadcast_editor_kb(),
+            reply_markup=(
+                _yadreno_request_error_keyboard(
+                    message.from_user.id,
+                    YADRENO_ADMIN_BROADCAST_TOPIC_ID,
+                    error,
+                )
+                if error.kind == "configuration"
+                else broadcast_editor_kb()
+            ),
             force_new=True,
         )
         return
@@ -1624,7 +1710,15 @@ async def _handle_broadcast_yaa(
         await safe_edit_or_send(
             progress.final_target,
             format_yadreno_admin_error(error),
-            reply_markup=broadcast_editor_kb(),
+            reply_markup=(
+                _yadreno_request_error_keyboard(
+                    message.from_user.id,
+                    YADRENO_ADMIN_BROADCAST_TOPIC_ID,
+                    error,
+                )
+                if error.kind == "configuration"
+                else broadcast_editor_kb()
+            ),
         )
         return
     finally:
@@ -1769,6 +1863,7 @@ async def handle_yaa_command(message: Message, command: CommandObject, state: FS
             reply_markup=_yadreno_request_error_keyboard(
                 message.from_user.id,
                 YADRENO_ADMIN_YAA_TOPIC_ID,
+                e,
             ),
         )
         return
@@ -1841,7 +1936,7 @@ async def handle_yadreno_chat_attachment(message: Message, state: FSMContext):
         await _handle_yadreno_chat_album_item(message, topic_id, api_key)
         return
 
-    raw_prompt = get_message_text_for_storage(message, 'plain').strip()
+    raw_prompt = _message_prompt_text(message, topic_id)
     metadata_only = _is_metadata_only_media(message)
     attachment_context = _extract_chat_attachment_context(message)
     if metadata_only and not raw_prompt:
@@ -1927,6 +2022,7 @@ async def handle_yadreno_chat_attachment(message: Message, state: FSMContext):
             reply_markup=_yadreno_request_error_keyboard(
                 message.from_user.id,
                 topic_id,
+                e,
             ),
         )
     finally:

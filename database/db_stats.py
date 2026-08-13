@@ -7,6 +7,7 @@ import json
 from collections.abc import Iterable
 from typing import Optional, List, Dict, Any, Tuple
 from .connection import get_db
+from .payment_semantics import paid_key_purchase_predicate
 
 logger = logging.getLogger(__name__)
 
@@ -126,26 +127,13 @@ def _broadcast_recipient_query_parts(
             """
         )
     if 'never_paid' in selected:
+        paid_key_predicate = paid_key_purchase_predicate('paid_order')
         conditions.append(
-            """
+            f"""
             NOT EXISTS (
                 SELECT 1 FROM payments paid_order
                 WHERE paid_order.user_id = u.id
-                  AND paid_order.status = 'paid'
-                  AND COALESCE(
-                        NULLIF(paid_order.purpose, ''),
-                        'legacy_key_payment'
-                      ) IN (
-                        'legacy_key_payment',
-                        'key_purchase',
-                        'key_renewal'
-                      )
-                  AND COALESCE(paid_order.payment_type, '') NOT IN (
-                        'trial',
-                        'promo_free',
-                        'demo'
-                      )
-                  AND COALESCE(paid_order.is_promo_free, 0) = 0
+                  AND {paid_key_predicate}
             )
             """
         )

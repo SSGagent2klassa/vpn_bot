@@ -41,6 +41,9 @@ __all__ = [
     'clear_yadreno_admin_tool_runtime',
     'list_yadreno_admin_tool_runtime',
     'is_crypto_enabled',
+    'is_cryptobot_enabled',
+    'is_cryptobot_configured',
+    'get_cryptobot_token',
     'is_stars_enabled',
     'is_crypto_configured',
     'is_cards_enabled',
@@ -449,6 +452,21 @@ def list_yadreno_admin_tool_runtime(
 def is_crypto_enabled() -> bool:
     """Checks if crypto payments are enabled."""
     return get_setting('crypto_enabled', '0') == '1'
+
+
+def is_cryptobot_enabled() -> bool:
+    """Return whether new Crypto Pay invoices may be created."""
+    return get_setting('cryptobot_enabled', '0') == '1'
+
+
+def get_cryptobot_token() -> str:
+    """Return the configured Crypto Pay API token, or an empty string."""
+    return str(get_setting('cryptobot_api_token', '') or '').strip()
+
+
+def is_cryptobot_configured() -> bool:
+    """Return whether Crypto Pay is enabled and has an API token."""
+    return is_cryptobot_enabled() and bool(get_cryptobot_token())
 
 def is_stars_enabled() -> bool:
     """Checks if Telegram Stars is enabled."""

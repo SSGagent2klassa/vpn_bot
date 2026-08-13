@@ -12,7 +12,7 @@ from bot.utils.datetime_format import format_datetime_for_display
 from bot.utils.text import escape_html, safe_edit_or_send
 from bot.utils.panel_email import get_panel_email_prefix
 from bot.states.admin_states import AdminStates
-from bot.keyboards.admin import users_menu_kb, users_list_kb, user_view_kb, user_ban_confirm_kb, key_view_kb, add_key_group_kb, add_key_server_kb, add_key_inbound_kb, add_key_step_kb, add_key_confirm_kb, users_input_cancel_kb, key_action_cancel_kb, back_and_home_kb, home_only_kb
+from bot.keyboards.admin import users_menu_kb, users_list_kb, user_view_kb, user_ban_confirm_kb, key_view_kb, add_key_group_kb, add_key_server_kb, add_key_step_kb, add_key_confirm_kb, users_input_cancel_kb, key_action_cancel_kb, back_and_home_kb, home_only_kb
 from bot.services.vpn_api import (
     get_client_from_server_data,
     get_client_inbound_descriptors,
@@ -69,14 +69,7 @@ async def show_key_view(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.key_view)
     await state.update_data(current_key_id=key_id)
-    if key.get('custom_name'):
-        key_name = key['custom_name']
-    else:
-        uuid = key.get('client_uuid') or ''
-        if len(uuid) >= 8:
-            key_name = f'{uuid[:4]}...{uuid[-4:]}'
-        else:
-            key_name = uuid or f'Ключ #{key_id}'
+    key_name = key.get('custom_name') or f'Ключ #{key_id}'
     server_name = escape_html(key.get('server_name', 'Неизвестный сервер'))
     tariff_name = (
         'Произвольный тариф'
@@ -309,7 +302,6 @@ async def select_add_key_server(callback: CallbackQuery, state: FSMContext):
         await callback.answer('⛔ Доступ запрещён', show_alert=True)
         return
     from database.requests import get_active_servers_by_group, get_server_by_id
-    from bot.services.vpn_api import is_subscription_mode
     server_id = int(callback.data.split(':')[1])
     server = get_server_by_id(server_id)
     data = await state.get_data()
@@ -322,53 +314,20 @@ async def select_add_key_server(callback: CallbackQuery, state: FSMContext):
         return
     await state.update_data(add_key_server_id=server_id)
 
-    # Subscription mode: skip the inbound selection - the key is created in all
-    if is_subscription_mode():
-        try:
-            client = get_client_from_server_data(server)
-            descriptors = await get_client_inbound_descriptors(
-                client,
-                subscription_mode=True,
-            )
-            if not descriptors:
-                await callback.answer('❌ На сервере нет inbound', show_alert=True)
-                return
-        except VPNAPIError as e:
-            await callback.answer(f'❌ Ошибка: {e}', show_alert=True)
-            return
-        await state.update_data(
-            add_key_inbound_id=None,
-            add_key_allowed_inbound_ids=[descriptor.id for descriptor in descriptors],
-        )
-        await state.set_state(AdminStates.add_key_traffic)
-        rendered = await safe_edit_or_send(callback.message,
-            '📊 <b>Лимит трафика</b>\n\nВведите лимит в ГБ (0 = без лимита):',
-            reply_markup=add_key_step_kb(4))
-        await state.update_data(
-            add_key_dialog_message_id=getattr(
-                rendered,
-                'message_id',
-                callback.message.message_id,
-            ),
-        )
-        await callback.answer()
-        return
-
     try:
         client = get_client_from_server_data(server)
         descriptors = await get_client_inbound_descriptors(
             client,
-            subscription_mode=False,
         )
-        inbounds = [descriptor.as_inbound() for descriptor in descriptors]
-        if not inbounds:
+        if not any(descriptor.available for descriptor in descriptors):
             await callback.answer('❌ На сервере нет inbound', show_alert=True)
             return
-        await state.update_data(
-            add_key_allowed_inbound_ids=[int(inbound['id']) for inbound in inbounds],
+        await state.set_state(AdminStates.add_key_traffic)
+        rendered = await safe_edit_or_send(
+            callback.message,
+            '📊 <b>Лимит трафика</b>\n\nВведите лимит в ГБ (0 = без лимита):',
+            reply_markup=add_key_step_kb(4),
         )
-        await state.set_state(AdminStates.add_key_inbound)
-        rendered = await safe_edit_or_send(callback.message, f"🖥️ <b>Сервер:</b> <code>{server['name']}</code>\n\nВыберите протокол (inbound):", reply_markup=add_key_inbound_kb(inbounds))
         await state.update_data(
             add_key_dialog_message_id=getattr(
                 rendered,
@@ -378,32 +337,6 @@ async def select_add_key_server(callback: CallbackQuery, state: FSMContext):
         )
     except VPNAPIError as e:
         await callback.answer(f'❌ Ошибка: {e}', show_alert=True)
-    await callback.answer()
-
-@router.callback_query(F.data.startswith('admin_add_key_inbound:'))
-async def select_add_key_inbound(callback: CallbackQuery, state: FSMContext):
-    """Selecting inbound for the new key."""
-    if not is_admin(callback.from_user.id):
-        await callback.answer('⛔ Доступ запрещён', show_alert=True)
-        return
-    inbound_id = int(callback.data.split(':')[1])
-    data = await state.get_data()
-    allowed_inbound_ids = {
-        int(value) for value in data.get('add_key_allowed_inbound_ids', [])
-    }
-    if inbound_id not in allowed_inbound_ids:
-        await callback.answer('❌ Inbound недоступен', show_alert=True)
-        return
-    await state.update_data(add_key_inbound_id=inbound_id)
-    await state.set_state(AdminStates.add_key_traffic)
-    rendered = await safe_edit_or_send(callback.message, '📊 <b>Лимит трафика</b>\n\nВведите лимит в ГБ (0 = без лимита):', reply_markup=add_key_step_kb(4))
-    await state.update_data(
-        add_key_dialog_message_id=getattr(
-            rendered,
-            'message_id',
-            callback.message.message_id,
-        ),
-    )
     await callback.answer()
 
 @router.message(AdminStates.add_key_traffic, F.text, ~F.text.startswith('/'))
@@ -495,6 +428,28 @@ async def process_add_key_devices(message: Message, state: FSMContext):
 @router.callback_query(F.data == 'admin_add_key_confirm')
 @regular_panel_operation
 async def confirm_add_key(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """Serialize manual key creation for the selected user."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer('⛔ Доступ запрещён', show_alert=True)
+        return
+    data = await state.get_data()
+    try:
+        lock_id = int(data.get('add_key_user_id'))
+    except (TypeError, ValueError):
+        await callback.answer('❌ Данные формы устарели', show_alert=True)
+        return
+
+    from bot.services.user_locks import user_locks
+
+    async with user_locks[lock_id]:
+        await _confirm_add_key_locked(callback, state, bot)
+
+
+async def _confirm_add_key_locked(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+):
     """Confirmation and key creation."""
     if not is_admin(callback.from_user.id):
         await callback.answer('⛔ Доступ запрещён', show_alert=True)
@@ -503,7 +458,6 @@ async def confirm_add_key(callback: CallbackQuery, state: FSMContext, bot: Bot):
     user_id = data.get('add_key_user_id')
     user_telegram_id = data.get('add_key_user_telegram_id')
     server_id = data.get('add_key_server_id')
-    inbound_id = data.get('add_key_inbound_id')
     group_id = data.get('add_key_group_id')
     traffic_gb = data.get('add_key_traffic_gb', 0)
     days = data.get('add_key_days', 0)
@@ -531,9 +485,6 @@ async def confirm_add_key(callback: CallbackQuery, state: FSMContext, bot: Bot):
         get_admin_custom_tariff,
         get_server_by_id,
     )
-    from database.db_keys import create_vpn_key_subscription_admin
-    from bot.services.vpn_api import is_subscription_mode
-    import uuid as _uuid
     server = get_server_by_id(server_id)
     allowed_server_ids = {
         int(item['id']) for item in get_active_servers_by_group(group_id)
@@ -545,96 +496,78 @@ async def confirm_add_key(callback: CallbackQuery, state: FSMContext, bot: Bot):
     if user is None or int(user['id']) != user_id:
         await callback.answer('Пользователь не найден', show_alert=True)
         return
-    subscription_mode = is_subscription_mode() and inbound_id is None
-    allowed_inbound_ids = {
-        int(value) for value in data.get('add_key_allowed_inbound_ids', [])
-    }
-    if not subscription_mode:
-        try:
-            inbound_id = int(inbound_id)
-        except (TypeError, ValueError):
-            await callback.answer('Inbound не выбран', show_alert=True)
-            return
-        if inbound_id not in allowed_inbound_ids:
-            await callback.answer('Inbound недоступен', show_alert=True)
-            return
     email = generate_unique_email(user)
     traffic_limit_bytes = traffic_gb * 1024 ** 3
+    panel_client = None
+    provisioned = None
+    key_id = None
     try:
         admin_tariff = get_admin_custom_tariff(group_id)
         if admin_tariff is None:
             raise RuntimeError('Системный тариф группы не найден')
         tariff_id = admin_tariff['id']
 
-        if subscription_mode:
-            sub_id = _uuid.uuid4().hex
-            provisioned = await provision_client_on_server(
-                server_id=server_id,
-                email=email,
-                total_gb=traffic_gb,
-                expire_days=days,
-                limit_ip=devices,
-                tg_id=str(user_telegram_id),
-                sub_id=sub_id,
-                subscription_mode=True,
-            )
-            first_inbound_id = provisioned.primary_inbound_id
-            first_uuid = provisioned.credential
-            created = len(provisioned.attached_inbound_ids)
-            if not first_uuid or first_inbound_id is None or created == 0:
-                raise RuntimeError('Не удалось создать ни одного клиента на сервере')
-            sub_id = provisioned.sub_id or sub_id
-            key_id = create_vpn_key_subscription_admin(
-                user_id=user_id, server_id=server_id, tariff_id=tariff_id,
-                panel_inbound_id=first_inbound_id, panel_email=email,
-                client_uuid=first_uuid, sub_id=sub_id,
-                days=days, traffic_limit=traffic_limit_bytes,
-                traffic_limit_override=traffic_limit_bytes,
-                max_ips_override=devices,
-            )
-            if not provisioned.complete:
-                from bot.services.vpn_api import sync_key_to_panel_state
-                sync_kwargs = (
-                    {'panel_snapshot': provisioned.snapshot}
-                    if provisioned.snapshot is not None
-                    else {}
-                )
-                sync_stats = await sync_key_to_panel_state(
-                    key_id,
-                    **sync_kwargs,
-                )
-                if not sync_stats.get('ok'):
-                    logger.warning(f"admin_add_key: subscription-ключ {key_id} синхронизирован не полностью: {sync_stats}")
-        else:
-            provisioned = await provision_client_on_server(
-                server_id=server_id,
-                email=email,
-                total_gb=traffic_gb,
-                expire_days=days,
-                limit_ip=devices,
-                tg_id=str(user_telegram_id),
-                subscription_mode=False,
-                inbound_ids=[inbound_id],
-            )
-            if provisioned.primary_inbound_id is None or not provisioned.credential:
-                raise RuntimeError('Не удалось создать клиента на выбранном inbound')
-            client_uuid = provisioned.credential
-            key_id = create_vpn_key_admin(
-                user_id=user_id, server_id=server_id, tariff_id=tariff_id,
-                panel_inbound_id=inbound_id, panel_email=email,
-                client_uuid=client_uuid, days=days,
-                traffic_limit=traffic_limit_bytes,
-                traffic_limit_override=traffic_limit_bytes,
-                max_ips_override=devices,
-            )
+        sub_id = uuid.uuid4().hex
+        panel_client = get_client_from_server_data(server)
+        provisioned = await provision_client_on_server(
+            server_id=server_id,
+            email=email,
+            total_gb=traffic_gb,
+            total_gb_bytes=traffic_limit_bytes,
+            expire_days=days,
+            limit_ip=devices,
+            tg_id=str(user_telegram_id),
+            sub_id=sub_id,
+            client=panel_client,
+        )
+        sub_id = provisioned.sub_id
+        if not provisioned.attached_inbound_ids or not sub_id:
+            raise RuntimeError('Не удалось создать ни одного клиента на сервере')
+        key_id = create_vpn_key_admin(
+            user_id=user_id,
+            server_id=server_id,
+            tariff_id=tariff_id,
+            panel_email=email,
+            sub_id=sub_id,
+            days=days,
+            traffic_limit=traffic_limit_bytes,
+            traffic_limit_override=traffic_limit_bytes,
+            max_ips_override=devices,
+        )
+        if not provisioned.complete:
+            from bot.services.vpn_api import sync_key_to_panel_state
 
+            sync_kwargs = (
+                {'panel_snapshot': provisioned.snapshot}
+                if provisioned.snapshot is not None
+                else {}
+            )
+            sync_stats = await sync_key_to_panel_state(key_id, **sync_kwargs)
+            if not sync_stats.get('ok'):
+                logger.warning(
+                    'Admin key %s was provisioned partially: %s',
+                    key_id,
+                    sync_stats,
+                )
+
+        await state.set_data({'current_user_telegram_id': user_telegram_id})
         await callback.answer('✅ Ключ успешно создан!', show_alert=True)
         await _show_user_view_edit(callback, state, user_telegram_id)
     except VPNAPIError as e:
+        if panel_client is not None and key_id is None:
+            try:
+                await panel_client.delete_client(email)
+            except Exception:
+                logger.exception('Could not clean failed admin key candidate email=%s', email)
         logger.error(f'Ошибка создания ключа: {e}')
         await callback.answer(f'❌ Ошибка: {e}', show_alert=True)
     except Exception as e:
-        logger.error(f'Неожиданная ошибка: {e}')
+        if panel_client is not None and key_id is None:
+            try:
+                await panel_client.delete_client(email)
+            except Exception:
+                logger.exception('Could not clean failed admin key candidate email=%s', email)
+        logger.exception('Unexpected admin key creation error: %s', e)
         await callback.answer('❌ Ошибка при создании ключа', show_alert=True)
 
 @router.callback_query(F.data == 'admin_user_add_key_cancel')
@@ -668,10 +601,7 @@ async def add_key_back(callback: CallbackQuery, state: FSMContext):
             '📂 <b>Группа тарифа</b>\n\nВыберите группу:',
             reply_markup=add_key_group_kb(get_all_groups()),
         )
-    elif current_state in {
-        AdminStates.add_key_inbound.state,
-        AdminStates.add_key_traffic.state,
-    }:
+    elif current_state == AdminStates.add_key_traffic.state:
         servers = get_active_servers_by_group(group_id) if group_id else []
         await state.set_state(AdminStates.add_key_server)
         user = get_user_by_telegram_id(data.get('add_key_user_telegram_id'))

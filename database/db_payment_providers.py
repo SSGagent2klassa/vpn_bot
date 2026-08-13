@@ -1,4 +1,4 @@
-"""Storage of connections between core orders and custom payment providers."""
+"""Storage of connections between core orders and external payment providers."""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,7 @@ _ALLOWED_PROVIDER_ORDER_STATUSES = {'pending', 'succeeded', 'canceled'}
 
 
 def create_payment_provider_support_tables(conn: sqlite3.Connection) -> None:
-    """Creates a system table of custom payment providers."""
+    """Creates the shared system table for provider-side payment orders."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS payment_provider_orders (
@@ -73,7 +73,7 @@ def save_payment_provider_order(
     charge_amount: str | None = None,
     charge_currency: str | None = None,
 ) -> bool:
-    """Saves or updates the external order of any payment provider."""
+    """Save or update the external order of any payment provider."""
     normalized_status = _normalize_status(status)
     metadata_json = json.dumps(dict(metadata or {}), ensure_ascii=False)
     with get_db() as conn:
@@ -115,7 +115,7 @@ def save_payment_provider_order(
 
 
 def get_payment_provider_order(order_id: str) -> Optional[dict[str, Any]]:
-    """Returns a custom provider record by core order_id."""
+    """Return a built-in or custom provider record by core order_id."""
     with get_db() as conn:
         create_payment_provider_support_tables(conn)
         row = conn.execute(
@@ -175,6 +175,29 @@ def get_open_payment_provider_orders(limit: int = 50) -> list[dict[str, Any]]:
         return [_row_to_dict(row) for row in rows]
 
 
+def list_pending_payment_provider_orders(provider_id: str) -> list[dict[str, Any]]:
+    """Return every unconfirmed pending core order for one provider."""
+    normalized_provider = str(provider_id or '').strip().casefold()
+    if not normalized_provider:
+        return []
+    with get_db() as conn:
+        create_payment_provider_support_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT ppo.*
+            FROM payment_provider_orders ppo
+            JOIN payments p ON p.order_id = ppo.order_id
+            WHERE ppo.provider_id = ?
+              AND ppo.status = 'pending'
+              AND p.status = 'pending'
+              AND p.provider_confirmed_at IS NULL
+            ORDER BY ppo.created_at ASC, ppo.id ASC
+            """,
+            (normalized_provider,),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
 def get_retryable_confirmed_payment_provider_orders(limit: int = 10) -> list[dict[str, Any]]:
     """Returns settled v1 provider orders whose core fulfillment is incomplete."""
     try:
@@ -212,7 +235,7 @@ def update_payment_provider_order_status(
     payment_url: str | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> bool:
-    """Updates the status of a custom payment."""
+    """Update the status and safe metadata of an external payment."""
     normalized_status = _normalize_status(status)
     metadata_json = json.dumps(dict(metadata or {}), ensure_ascii=False) if metadata is not None else None
     with get_db() as conn:
@@ -289,6 +312,7 @@ __all__ = [
     'get_payment_provider_order',
     'get_open_payment_provider_orders',
     'get_retryable_confirmed_payment_provider_orders',
+    'list_pending_payment_provider_orders',
     'save_payment_provider_order',
     'update_payment_provider_order_status',
 ]

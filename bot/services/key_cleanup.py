@@ -183,22 +183,9 @@ async def cleanup_inactive_panel_clients(
                     )
                 continue
 
-            delete_by_email = getattr(
-                client,
-                "delete_clients_by_email_on_server",
-                None,
-            )
-            if not callable(delete_by_email):
-                report.errors += len(candidates)
-                logger.warning(
-                    "Daily panel cleanup cannot delete clients on server %s",
-                    server_id,
-                )
-                continue
-
             for email in candidates:
                 try:
-                    report.deleted += int(await delete_by_email(email))
+                    report.deleted += int(await client.delete_client(email))
                 except Exception as exc:
                     report.errors += 1
                     logger.warning(
@@ -218,7 +205,7 @@ async def cleanup_inactive_panel_clients(
 
 
 def _deleted_key_display_name(key: Mapping[str, Any]) -> str:
-    for field_name in ("custom_name", "panel_email", "client_uuid", "id"):
+    for field_name in ("custom_name", "panel_email", "id"):
         value = key.get(field_name)
         if value is not None and str(value).strip():
             return str(value).strip()

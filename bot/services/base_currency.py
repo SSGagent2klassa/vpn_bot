@@ -53,23 +53,40 @@ async def switch_base_currency(
     entered = normalize_transition_input(old_units_per_new)
     conversion = Decimal('1') / entered
     async with _switch_lock:
-        if get_base_currency() != str(expected_from_currency).upper():
-            raise RuntimeError('Base currency changed while confirmation was open')
-        preview = preview_base_currency_switch(target_currency, conversion)
-        if int(preview.get('blocking_intents') or 0) > 0:
-            raise BaseCurrencySwitchBlocked(
-                'Confirmed payments must be fulfilled before switching currency'
-            )
-        backup_path = await asyncio.to_thread(create_bot_database_backup)
-        result = await asyncio.to_thread(
-            execute_base_currency_switch_record,
-            expected_from_currency=str(expected_from_currency).upper(),
-            target_currency=str(target_currency).upper(),
-            to_units_per_from=conversion,
-            from_units_per_to=entered,
-            admin_telegram_id=int(admin_telegram_id),
-            backup_path=backup_path,
+        from bot.services.cryptobot import cryptobot_lifecycle_lock
+        from bot.services.payment_provider_cancellation import (
+            CryptoBotCancellationUncertain,
+            CryptoBotPaymentConfirmed,
+            cancel_pending_cryptobot_for_base_switch,
         )
+
+        async with cryptobot_lifecycle_lock():
+            if get_base_currency() != str(expected_from_currency).upper():
+                raise RuntimeError('Base currency changed while confirmation was open')
+            preview = preview_base_currency_switch(target_currency, conversion)
+            if int(preview.get('blocking_intents') or 0) > 0:
+                raise BaseCurrencySwitchBlocked(
+                    'Confirmed payments must be fulfilled before switching currency'
+                )
+            try:
+                await cancel_pending_cryptobot_for_base_switch()
+            except (
+                CryptoBotCancellationUncertain,
+                CryptoBotPaymentConfirmed,
+            ) as error:
+                raise BaseCurrencySwitchBlocked(
+                    'Crypto Pay invoices could not be finalized before currency switch'
+                ) from error
+            backup_path = await asyncio.to_thread(create_bot_database_backup)
+            result = await asyncio.to_thread(
+                execute_base_currency_switch_record,
+                expected_from_currency=str(expected_from_currency).upper(),
+                target_currency=str(target_currency).upper(),
+                to_units_per_from=conversion,
+                from_units_per_to=entered,
+                admin_telegram_id=int(admin_telegram_id),
+                backup_path=backup_path,
+            )
         result['old_units_per_new'] = _decimal_text(entered)
         return result
 

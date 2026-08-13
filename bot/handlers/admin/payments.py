@@ -21,6 +21,7 @@ from database.requests import (
     get_currency_rate,
     set_currency_rate,
     is_crypto_enabled,
+    is_cryptobot_enabled,
     is_stars_enabled,
     is_cards_enabled,
     is_yookassa_qr_enabled,
@@ -117,6 +118,7 @@ async def show_payments_menu(callback: CallbackQuery, state: FSMContext):
 
     stars = is_stars_enabled()
     crypto = is_crypto_enabled()
+    cryptobot = is_cryptobot_enabled()
     cards = is_cards_enabled()
     qr = is_yookassa_qr_enabled()
     demo = is_demo_payment_enabled()
@@ -133,6 +135,11 @@ async def show_payments_menu(callback: CallbackQuery, state: FSMContext):
         text += "🟢 <b>Telegram Stars</b>\n"
     else:
         text += "⚪ <b>Telegram Stars</b>\n"
+
+    if cryptobot:
+        text += "🟢 <b>Crypto Pay (@CryptoBot)</b>\n"
+    else:
+        text += "⚪ <b>Crypto Pay (@CryptoBot)</b>\n"
 
     if crypto:
         item_url = get_setting('crypto_item_url', '')
@@ -188,6 +195,7 @@ async def show_payments_menu(callback: CallbackQuery, state: FSMContext):
             platega,
             cardlink,
             notify_enabled=notify,
+            cryptobot_enabled=cryptobot,
         )
     )
     await callback.answer()
@@ -426,7 +434,8 @@ async def confirm_base_currency_switch(callback: CallbackQuery, state: FSMContex
         await safe_edit_or_send(
             callback.message,
             "⚠️ <b>Переключение отложено</b>\n\n"
-            "Есть подтверждённый платёж, который ещё выполняется. Повторите после его завершения.",
+            "Не удалось безопасно завершить проверку незакрытых платежей. "
+            "Базовая валюта не изменена — повторите действие позже.",
             reply_markup=base_currency_switch_input_kb(),
         )
         await callback.answer()

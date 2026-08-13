@@ -16,9 +16,7 @@ __all__ = [
     'get_vpn_key_by_id',
     'extend_vpn_key',
     'create_vpn_key_admin',
-    'create_vpn_key_subscription_admin',
-    'update_vpn_key_connection',
-    'create_vpn_key',
+    'update_vpn_key_binding',
     'create_initial_vpn_key',
     'is_key_active',
     'is_traffic_exhausted',
@@ -33,11 +31,10 @@ __all__ = [
     'update_key_traffic_limit',
     'update_vpn_key_tariff_and_traffic_limit',
     'reissue_vpn_key_plan',
-    'update_vpn_key_config',
-    'update_vpn_key_sub_id',
     'delete_vpn_key',
     'get_all_keys_with_server',
     'get_user_keys_for_display',
+    'get_user_key_snapshot_stats',
     'get_key_details_for_user',
     'update_key_custom_name',
     'add_days_to_first_active_key',
@@ -57,8 +54,8 @@ def get_user_vpn_keys(user_id: int) -> List[Dict[str, Any]]:
     with get_db() as conn:
         cursor = conn.execute("""
             SELECT
-                vk.id, vk.client_uuid, vk.custom_name, vk.expires_at,
-                vk.created_at, vk.panel_inbound_id, vk.panel_email, vk.sub_id,
+                vk.id, vk.custom_name, vk.expires_at,
+                vk.created_at, vk.panel_email, vk.sub_id,
                 t.name as tariff_name, t.duration_days,
                 s.name as server_name, s.id as server_id
             FROM vpn_keys vk
@@ -90,7 +87,7 @@ def get_vpn_key_by_id(key_id: int) -> Optional[Dict[str, Any]]:
                 COALESCE((SELECT value FROM settings WHERE key = 'base_currency'), 'RUB') AS base_currency,
                 s.name as server_name, s.host, s.port, s.web_base_path,
                 s.login, s.password, s.protocol, s.api_token,
-                s.panel_version, s.panel_api_profile, s.panel_checked_at,
+                s.panel_version, s.panel_checked_at,
                 s.is_active as server_active,
                 u.telegram_id, u.username, u.is_banned
             FROM vpn_keys vk
@@ -150,27 +147,25 @@ def extend_vpn_key(
         return success
 
 def create_vpn_key_admin(
-    user_id: int, 
-    server_id: int, 
+    user_id: int,
+    server_id: int,
     tariff_id: int,
-    panel_inbound_id: int,
     panel_email: str,
-    client_uuid: str,
+    sub_id: str,
     days: int,
     traffic_limit: int = 0,
     traffic_limit_override: Optional[int] = None,
     max_ips_override: Optional[int] = None,
 ) -> int:
     """
-    Creates a VPN key by the administrator (without payment).
+    Creates a configured subscription key without payment.
     
     Args:
         user_id: Internal user ID
         server_id: Server ID
         tariff_id: Tariff ID
-        panel_inbound_id: ID inbound in the panel
-        panel_email: Email (identifier) of the client in the panel
-        client_uuid: Client UUID
+        panel_email: Logical client identifier in the panel
+        sub_id: Subscription identifier shared by all client memberships
         days: Validity period in days
         traffic_limit: Traffic limit in bytes (0 = unlimited)
     
@@ -180,89 +175,59 @@ def create_vpn_key_admin(
     with get_db() as conn:
         custom_name = _allocate_key_custom_name_with_conn(conn, user_id)
         cursor = conn.execute("""
-            INSERT INTO vpn_keys 
-            (user_id, server_id, tariff_id, panel_inbound_id, panel_email,
-             client_uuid, custom_name, expires_at, traffic_limit,
+            INSERT INTO vpn_keys
+            (user_id, server_id, tariff_id, panel_email, sub_id,
+             custom_name, expires_at, traffic_limit,
              traffic_limit_override, max_ips_override)
-            VALUES (?, ?, ?, ?, ?, ?, ?,
+            VALUES (?, ?, ?, ?, ?, ?,
                     CASE WHEN ? = 0 THEN NULL
                          ELSE datetime('now', '+' || ? || ' days') END,
                     ?, ?, ?)
-        """, (user_id, server_id, tariff_id, panel_inbound_id, panel_email,
-              client_uuid, custom_name, days, days, traffic_limit,
+        """, (user_id, server_id, tariff_id, panel_email, sub_id,
+              custom_name, days, days, traffic_limit,
               traffic_limit_override, max_ips_override))
         key_id = cursor.lastrowid
         logger.info(f"Администратор создал ключ ID {key_id} для user_id {user_id}")
         return key_id
 
-def update_vpn_key_connection(
+def update_vpn_key_binding(
     key_id: int,
     server_id: int,
-    panel_inbound_id: int,
     panel_email: str,
-    client_uuid: str,
-    sub_id: Optional[str] = ...,
+    sub_id: str,
 ) -> bool:
-    """
-    Updates the technical data of the key (server, UUID, inbound).
-    Used when replacing a key.
+    """Atomically binds a draft or replacement key to one subscription.
 
     Args:
         key_id: Key ID
-        server_id: ID of the new server
-        panel_inbound_id: ID inbound in the panel
-        panel_email: Email (identifier) of the client in the panel
-        client_uuid: New client UUID
-        sub_id: Subscription ID. If passed (including None) - updated
-                in the database. Default (Ellipsis) - the field is not touched.
+        server_id: Target server ID
+        panel_email: Logical panel client identifier
+        sub_id: Non-empty subscription identifier
 
     Returns:
         True if successful
     """
+    normalized_email = str(panel_email or '').strip()
+    normalized_sub_id = str(sub_id or '').strip()
+    if not normalized_email or not normalized_sub_id:
+        raise ValueError('Configured subscription requires panel_email and sub_id')
     with get_db() as conn:
-        if sub_id is ...:
-            cursor = conn.execute("""
-                UPDATE vpn_keys
-                SET server_id = ?,
-                    panel_inbound_id = ?,
-                    panel_email = ?,
-                    client_uuid = ?
-                WHERE id = ?
-            """, (server_id, panel_inbound_id, panel_email, client_uuid, key_id))
-        else:
-            cursor = conn.execute("""
-                UPDATE vpn_keys
-                SET server_id = ?,
-                    panel_inbound_id = ?,
-                    panel_email = ?,
-                    client_uuid = ?,
-                    sub_id = ?
-                WHERE id = ?
-            """, (server_id, panel_inbound_id, panel_email, client_uuid, sub_id, key_id))
+        cursor = conn.execute(
+            """
+            UPDATE vpn_keys
+            SET server_id = ?, panel_email = ?, sub_id = ?
+            WHERE id = ?
+            """,
+            (server_id, normalized_email, normalized_sub_id, key_id),
+        )
         success = cursor.rowcount > 0
         if success:
-            preview = (client_uuid[:4] + '...') if client_uuid else '?'
-            logger.info(f"Ключ ID {key_id} перенесён на сервер {server_id} (новый UUID: {preview})")
+            logger.info(
+                "Ключ ID %s привязан к подписке на сервере %s",
+                key_id,
+                server_id,
+            )
         return success
-
-def create_vpn_key(
-    user_id: int, 
-    server_id: int, 
-    tariff_id: int,
-    panel_inbound_id: int,
-    panel_email: str,
-    client_uuid: str,
-    days: int,
-    traffic_limit: int = 0
-) -> int:
-    """
-    Creates a fully configured VPN key (wrapper over create_vpn_key_admin).
-    To create a draft, use create_initial_vpn_key.
-    """
-    return create_vpn_key_admin(
-        user_id, server_id, tariff_id, panel_inbound_id, 
-        panel_email, client_uuid, days, traffic_limit
-    )
 
 def _create_initial_vpn_key_with_conn(
     conn: sqlite3.Connection,
@@ -423,8 +388,8 @@ def get_all_active_keys_with_server() -> List[Dict[str, Any]]:
         cursor = conn.execute("""
             SELECT
                 vk.id, vk.panel_email, vk.traffic_used, vk.traffic_limit,
-                vk.traffic_notified_pct, vk.custom_name, vk.client_uuid,
-                vk.panel_inbound_id, vk.tariff_id, vk.expires_at, vk.sub_id,
+                vk.traffic_notified_pct, vk.custom_name,
+                vk.tariff_id, vk.expires_at, vk.sub_id,
                 vk.traffic_limit_override, vk.max_ips_override,
                 t.traffic_limit_gb AS tariff_traffic_limit_gb,
                 t.max_ips AS tariff_max_ips, t.group_id AS tariff_group_id,
@@ -475,8 +440,8 @@ def get_all_panel_sync_keys() -> List[Dict[str, Any]]:
         cursor = conn.execute("""
             SELECT
                 vk.id, vk.panel_email, vk.traffic_used, vk.traffic_limit,
-                vk.traffic_notified_pct, vk.custom_name, vk.client_uuid,
-                vk.panel_inbound_id, vk.tariff_id, vk.expires_at, vk.sub_id,
+                vk.traffic_notified_pct, vk.custom_name,
+                vk.tariff_id, vk.expires_at, vk.sub_id,
                 vk.traffic_limit_override, vk.max_ips_override,
                 t.traffic_limit_gb AS tariff_traffic_limit_gb,
                 t.max_ips AS tariff_max_ips, t.group_id AS tariff_group_id,
@@ -503,8 +468,7 @@ def get_all_keys_with_server() -> List[Dict[str, Any]]:
     with get_db() as conn:
         cursor = conn.execute("""
             SELECT
-                vk.id, vk.panel_email, vk.client_uuid,
-                vk.panel_inbound_id, vk.server_id, vk.sub_id,
+                vk.id, vk.panel_email, vk.server_id, vk.sub_id,
                 s.name as server_name,
                 u.telegram_id
             FROM vpn_keys vk
@@ -756,125 +720,6 @@ def reissue_vpn_key_plan(
             'max_ips_override': max_ips_override,
         }
 
-def update_vpn_key_config(
-    key_id: int,
-    server_id: int,
-    panel_inbound_id: int,
-    panel_email: str,
-    client_uuid: str,
-    sub_id: Optional[str] = ...,
-) -> bool:
-    """
-    Updates the key configuration (binds it to the server).
-    Used to complete the key setup.
-
-    Args:
-        key_id: Key ID
-        server_id: Server ID
-        panel_inbound_id: ID inbound on the panel
-        panel_email: Panel email
-        client_uuid: Client UUID
-        sub_id: Subscription ID. If passed (including None) - updated
-                in the database. Default (Ellipsis) - the field is not touched.
-
-    Returns:
-        True if successful
-    """
-    with get_db() as conn:
-        if sub_id is ...:
-            cursor = conn.execute("""
-                UPDATE vpn_keys
-                SET server_id = ?,
-                    panel_inbound_id = ?,
-                    panel_email = ?,
-                    client_uuid = ?
-                WHERE id = ?
-            """, (server_id, panel_inbound_id, panel_email, client_uuid, key_id))
-        else:
-            cursor = conn.execute("""
-                UPDATE vpn_keys
-                SET server_id = ?,
-                    panel_inbound_id = ?,
-                    panel_email = ?,
-                    client_uuid = ?,
-                    sub_id = ?
-                WHERE id = ?
-            """, (server_id, panel_inbound_id, panel_email, client_uuid, sub_id, key_id))
-        return cursor.rowcount > 0
-
-
-def update_vpn_key_sub_id(key_id: int, sub_id: Optional[str]) -> bool:
-    """
-    Updates the sub_id of the key.
-
-    Args:
-        key_id: Key ID
-        sub_id: New subscription ID (or None to clear)
-
-    Returns:
-        True if successful
-    """
-    with get_db() as conn:
-        cursor = conn.execute(
-            "UPDATE vpn_keys SET sub_id = ? WHERE id = ?",
-            (sub_id, key_id),
-        )
-        return cursor.rowcount > 0
-
-
-def create_vpn_key_subscription_admin(
-    user_id: int,
-    server_id: int,
-    tariff_id: int,
-    panel_inbound_id: int,
-    panel_email: str,
-    client_uuid: str,
-    sub_id: str,
-    days: int,
-    traffic_limit: int = 0,
-    traffic_limit_override: Optional[int] = None,
-    max_ips_override: Optional[int] = None,
-) -> int:
-    """
-    Creates a VPN key by the administrator in subscription mode.
-
-    Similar to create_vpn_key_admin, but additionally records sub_id.
-
-    Args:
-        user_id: Internal user ID
-        server_id: Server ID
-        tariff_id: Tariff ID
-        panel_inbound_id: Minimum inbound ID (for compatibility)
-        panel_email: Client email (common for all inbound)
-        client_uuid: UUID of the client from the minimum inbound
-        sub_id: Subscription ID (one for all inbounds of this key)
-        days: Validity period in days
-        traffic_limit: Traffic limit in bytes (0 = unlimited)
-
-    Returns:
-        Created key ID
-    """
-    with get_db() as conn:
-        custom_name = _allocate_key_custom_name_with_conn(conn, user_id)
-        cursor = conn.execute("""
-            INSERT INTO vpn_keys
-            (user_id, server_id, tariff_id, panel_inbound_id, panel_email,
-             client_uuid, sub_id, custom_name, expires_at, traffic_limit,
-             traffic_limit_override, max_ips_override)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?,
-                    CASE WHEN ? = 0 THEN NULL
-                         ELSE datetime('now', '+' || ? || ' days') END,
-                    ?, ?, ?)
-        """, (user_id, server_id, tariff_id, panel_inbound_id, panel_email,
-              client_uuid, sub_id, custom_name, days, days, traffic_limit,
-              traffic_limit_override, max_ips_override))
-        key_id = cursor.lastrowid
-        logger.info(
-            f"Администратор создал subscription-ключ ID {key_id} для user_id {user_id} "
-            f"(sub_id={sub_id[:8]}...)"
-        )
-        return key_id
-
 def delete_vpn_key(key_id: int) -> bool:
     """
     Removes the VPN key from the database.
@@ -912,7 +757,7 @@ def get_user_keys_for_display(telegram_id: int) -> List[Dict[str, Any]]:
     with get_db() as conn:
         cursor = conn.execute("""
             SELECT
-                vk.id, vk.client_uuid, vk.custom_name, vk.expires_at,
+                vk.id, vk.custom_name, vk.expires_at,
                 s.name as server_name, s.id as server_id, vk.panel_email,
                 vk.sub_id,
                 vk.traffic_used, vk.traffic_limit,
@@ -939,9 +784,6 @@ def get_user_keys_for_display(telegram_id: int) -> List[Dict[str, Any]]:
             # Forming display_name
             if key['custom_name']:
                 key['display_name'] = key['custom_name']
-            elif key['client_uuid']:
-                uuid = key['client_uuid']
-                key['display_name'] = f"{uuid[:4]}...{uuid[-4:]}"
             else:
                 if not key['server_id']:
                      key['display_name'] = f"Ключ #{key['id']} (Не настроен)"
@@ -950,6 +792,50 @@ def get_user_keys_for_display(telegram_id: int) -> List[Dict[str, Any]]:
             keys.append(key)
         
         return keys
+
+
+def get_user_key_snapshot_stats(user_id: int) -> Dict[str, int]:
+    """Returns bounded, independent key-state aggregates for one user."""
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_count,
+                COALESCE(SUM(CASE
+                    WHEN expires_at IS NULL OR expires_at > datetime('now')
+                    THEN 1 ELSE 0
+                END), 0) AS active_count,
+                COALESCE(SUM(CASE
+                    WHEN expires_at IS NOT NULL AND expires_at <= datetime('now')
+                    THEN 1 ELSE 0
+                END), 0) AS expired_count,
+                COALESCE(SUM(CASE
+                    WHEN server_id IS NULL
+                     AND panel_email IS NULL
+                     AND sub_id IS NULL
+                    THEN 1 ELSE 0
+                END), 0) AS draft_count,
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(traffic_limit, 0) > 0
+                     AND COALESCE(traffic_used, 0) >= traffic_limit
+                    THEN 1 ELSE 0
+                END), 0) AS traffic_exhausted_count
+            FROM vpn_keys
+            WHERE user_id = ?
+            """,
+            (int(user_id),),
+        ).fetchone()
+    return {
+        key: int(row[key] or 0)
+        for key in (
+            'total_count',
+            'active_count',
+            'expired_count',
+            'draft_count',
+            'traffic_exhausted_count',
+        )
+    }
+
 
 def get_key_details_for_user(key_id: int, telegram_id: int) -> Optional[Dict[str, Any]]:
     """
@@ -993,9 +879,6 @@ def get_key_details_for_user(key_id: int, telegram_id: int) -> Optional[Dict[str
         # Forming display_name
         if key['custom_name']:
             key['display_name'] = key['custom_name']
-        elif key['client_uuid']:
-            uuid = key['client_uuid']
-            key['display_name'] = f"{uuid[:4]}...{uuid[-4:]}"
         else:
             if not key['server_id']:
                  key['display_name'] = f"Ключ #{key['id']} (Не настроен)"

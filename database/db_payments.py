@@ -5,6 +5,7 @@ import string
 import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from .connection import get_db
+from .payment_semantics import paid_key_purchase_predicate
 
 logger = logging.getLogger(__name__)
 BASE62_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
@@ -23,6 +24,7 @@ __all__ = [
     'find_order_by_cardlink_bill_id',
     'find_latest_pending_cardlink_order_for_user',
     'get_user_payments_stats',
+    'get_user_payment_snapshot_stats',
     'get_daily_payments_stats',
     'get_key_payments_history',
     '_int_to_base62',
@@ -44,6 +46,7 @@ __all__ = [
     'get_active_referral_levels',
     'update_referral_level',
     'get_referral_stats',
+    'get_user_referral_snapshot_stats',
     'update_referral_stat',
     'is_referral_enabled',
     'get_referral_reward_type',
@@ -353,6 +356,87 @@ def get_user_payments_stats(user_id: int) -> Dict[str, Any]:
         stats['tariffs'] = [row['name'] for row in cursor.fetchall()]
         
         return stats
+
+
+def get_user_payment_snapshot_stats(user_id: int) -> Dict[str, Any]:
+    """Returns bounded payment aggregates for the extension user snapshot."""
+    paid_key_predicate = paid_key_purchase_predicate('p')
+    with get_db() as conn:
+        summary = conn.execute(
+            f"""
+            SELECT
+                COALESCE(SUM(CASE WHEN p.status = 'paid' THEN 1 ELSE 0 END), 0)
+                    AS successful_count,
+                COALESCE(SUM(CASE WHEN {paid_key_predicate} THEN 1 ELSE 0 END), 0)
+                    AS paid_key_count,
+                MAX(CASE WHEN p.status = 'paid' THEN datetime(p.paid_at) END)
+                    AS last_payment_at
+            FROM payments p
+            WHERE p.user_id = ?
+            """,
+            (int(user_id),),
+        ).fetchone()
+        amount_rows = conn.execute(
+            """
+            SELECT currency, COALESCE(SUM(amount_minor), 0) AS amount_minor
+            FROM (
+                SELECT
+                    CASE
+                        WHEN COALESCE(p.intent_version, 0) = 1
+                            THEN CASE
+                                WHEN UPPER(TRIM(COALESCE(p.base_currency, '')))
+                                     IN ('RUB', 'USD')
+                                    THEN UPPER(TRIM(p.base_currency))
+                                ELSE NULL
+                            END
+                        WHEN p.payment_type = 'crypto' THEN 'USDT'
+                        WHEN p.payment_type = 'stars' THEN 'XTR'
+                        WHEN p.payment_type IN (
+                            'cards', 'yookassa_qr', 'wata',
+                            'platega', 'cardlink', 'balance'
+                        ) THEN 'RUB'
+                        ELSE NULL
+                    END AS currency,
+                    CASE
+                        WHEN COALESCE(p.intent_version, 0) = 1
+                            THEN COALESCE(p.payable_amount_minor, p.payable_amount_cents, 0)
+                        WHEN p.payment_type = 'crypto'
+                            THEN COALESCE(p.final_amount_cents, p.amount_cents, 0)
+                        WHEN p.payment_type = 'stars'
+                            THEN COALESCE(p.final_amount_stars, p.amount_stars, 0)
+                        WHEN p.payment_type IN (
+                            'cards', 'yookassa_qr', 'wata',
+                            'platega', 'cardlink', 'balance'
+                        ) THEN COALESCE(
+                            p.final_amount_cents,
+                            CAST(ROUND(t.price_rub * 100) AS INTEGER),
+                            0
+                        )
+                        ELSE 0
+                    END AS amount_minor
+                FROM payments p
+                LEFT JOIN tariffs t ON t.id = p.tariff_id
+                WHERE p.user_id = ? AND p.status = 'paid'
+            ) paid_amounts
+            WHERE currency IS NOT NULL
+            GROUP BY currency
+            ORDER BY currency
+            """,
+            (int(user_id),),
+        ).fetchall()
+
+    paid_key_count = int(summary['paid_key_count'] or 0)
+    return {
+        'successful_count': int(summary['successful_count'] or 0),
+        'paid_key_count': paid_key_count,
+        'has_ever_paid_key': paid_key_count > 0,
+        'last_payment_at': summary['last_payment_at'],
+        'amounts_by_currency': {
+            str(row['currency']): int(row['amount_minor'] or 0)
+            for row in amount_rows
+        },
+    }
+
 
 def get_daily_payments_stats() -> Dict[str, Any]:
     """
@@ -1085,6 +1169,79 @@ def get_referral_stats(user_id: int) -> List[Dict[str, Any]]:
             result.append(rew)
             
         return result
+
+
+def get_user_referral_snapshot_stats(user_id: int) -> Dict[str, Any]:
+    """Returns bounded referral-tree and accumulated reward aggregates."""
+    with get_db() as conn:
+        counts = conn.execute(
+            """
+            WITH RECURSIVE referral_tree(id, level) AS (
+                SELECT id, 1
+                FROM users
+                WHERE referred_by = ?
+                UNION ALL
+                SELECT u.id, referral_tree.level + 1
+                FROM users u
+                JOIN referral_tree ON u.referred_by = referral_tree.id
+                WHERE referral_tree.level < 3
+            )
+            SELECT
+                COUNT(*) AS total_count,
+                COALESCE(SUM(CASE WHEN level = 1 THEN 1 ELSE 0 END), 0)
+                    AS direct_count
+            FROM referral_tree
+            """,
+            (int(user_id),),
+        ).fetchone()
+        reward_summary = conn.execute(
+            """
+            SELECT
+                COUNT(DISTINCT CASE
+                    WHEN COALESCE(total_payments_count, 0) > 0 THEN referral_id
+                END) AS paying_count,
+                COALESCE(SUM(total_reward_days), 0) AS reward_days
+            FROM referral_stats
+            WHERE referrer_id = ?
+            """,
+            (int(user_id),),
+        ).fetchone()
+        reward_rows = conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN UPPER(TRIM(COALESCE(reward_currency, ''))) IN ('RUB', 'USD')
+                        THEN UPPER(TRIM(reward_currency))
+                    ELSE 'RUB'
+                END AS currency,
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(total_reward_minor, 0) != 0
+                        THEN total_reward_minor
+                    ELSE COALESCE(total_reward_cents, 0)
+                END), 0) AS amount_minor
+            FROM referral_stats
+            WHERE referrer_id = ?
+            GROUP BY CASE
+                WHEN UPPER(TRIM(COALESCE(reward_currency, ''))) IN ('RUB', 'USD')
+                    THEN UPPER(TRIM(reward_currency))
+                ELSE 'RUB'
+            END
+            ORDER BY currency
+            """,
+            (int(user_id),),
+        ).fetchall()
+
+    return {
+        'direct_count': int(counts['direct_count'] or 0),
+        'total_count': int(counts['total_count'] or 0),
+        'paying_count': int(reward_summary['paying_count'] or 0),
+        'reward_amounts_by_currency': {
+            str(row['currency']): int(row['amount_minor'] or 0)
+            for row in reward_rows
+        },
+        'reward_days': int(reward_summary['reward_days'] or 0),
+    }
+
 
 def update_referral_stat(
     referrer_id: int, 

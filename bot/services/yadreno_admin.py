@@ -32,6 +32,10 @@ from bot.services.yadreno_admin_page_binding import (
     build_bound_yaa_runtime_context,
     get_yaa_page_binding,
 )
+from bot.services.yadreno_admin_customization_tools import (
+    CUSTOMIZATION_TOOL_NAMES,
+    execute_customization_tool,
+)
 from bot.version import BOT_COMMIT, BOT_RELEASE
 from config import RETRY_CONFIG
 from database.requests import (
@@ -71,10 +75,24 @@ PROGRESS_EVENTS_CAPABILITY = "progress_events"
 BROADCAST_EDITOR_CAPABILITY = "broadcast_editor_v1"
 RICH_MESSAGES_CAPABILITY = "rich_messages_v1"
 RUNTIME_CONTEXT_CAPABILITY = "runtime_context_v1"
+CUSTOMIZATION_TOOLS_CAPABILITY = "customization_tools_v1"
+YADRENO_ADMIN_TELEGRAM_HTML_TASK_FORMAT = "telegram_html"
 SATELLITE_PROTOCOL_VERSION = "v1"
 SATELLITE_CAPABILITIES: tuple[str, ...] = (
     PROGRESS_EVENTS_CAPABILITY,
     RICH_MESSAGES_CAPABILITY,
+)
+HUB_MAINTENANCE_FALLBACK_MESSAGE = (
+    "Сервис временно на техническом обслуживании. "
+    "Попробуйте снова через несколько минут."
+)
+HUB_TEMPORARILY_UNAVAILABLE_MESSAGE = (
+    "Хаб Yadreno Admin временно недоступен. Возможно, идёт техническое "
+    "обслуживание или обновление. Попробуйте снова через несколько минут."
+)
+_YADRENO_ADMIN_API_KEY_RE = re.compile(
+    r"[A-Za-z0-9\-._~+/]+=*",
+    flags=re.ASCII,
 )
 PUBLIC_IP_URLS = (
     "https://api.ipify.org",
@@ -146,6 +164,20 @@ def is_yadreno_admin_customization_topic(topic_id: int) -> bool:
     }
 
 
+def yadreno_admin_message_storage_format(
+    topic_id: int,
+) -> Literal["html", "plain"]:
+    """Return the Telegram message representation sent to the Hub."""
+    return "html" if is_yadreno_admin_customization_topic(topic_id) else "plain"
+
+
+def yadreno_admin_task_format_for_topic(topic_id: int) -> str | None:
+    """Return runtime metadata for the current user message, when required."""
+    if yadreno_admin_message_storage_format(topic_id) == "html":
+        return YADRENO_ADMIN_TELEGRAM_HTML_TASK_FORMAT
+    return None
+
+
 def is_yadreno_admin_broadcast_topic(topic_id: int) -> bool:
     """Return True only for the structured broadcast editor lane."""
     return int(topic_id) == YADRENO_ADMIN_BROADCAST_TOPIC_ID
@@ -155,13 +187,24 @@ def _capabilities_for_skill(
     skill_id: str,
     *,
     runtime_context_supported: bool = False,
+    customization_tools_supported: bool = False,
 ) -> list[str]:
-    """Advertise the editor capability only inside its isolated skill."""
+    """Advertise optional capabilities only inside their isolated skills."""
     capabilities = list(SATELLITE_CAPABILITIES)
     if skill_id == YADRENO_ADMIN_BROADCAST_SKILL_ID:
         capabilities.append(BROADCAST_EDITOR_CAPABILITY)
     elif runtime_context_supported:
         capabilities.append(RUNTIME_CONTEXT_CAPABILITY)
+        if (
+            skill_id == YADRENO_ADMIN_CUSTOMIZATION_SKILL_ID
+            and customization_tools_supported
+            and CUSTOMIZATION_TOOL_NAMES
+            == {
+                'satellite_customization_inspect',
+                'satellite_customization_apply',
+            }
+        ):
+            capabilities.append(CUSTOMIZATION_TOOLS_CAPABILITY)
     return capabilities
 
 
@@ -221,6 +264,8 @@ def build_agent_env_context() -> dict[str, Any]:
 
 def build_agent_runtime_context(
     extra_context: Optional[dict[str, Any]] = None,
+    *,
+    task_format: str | None = None,
 ) -> dict[str, Any]:
     """Build request-scoped runtime data for structured and legacy hubs."""
     context: dict[str, Any] = {
@@ -228,287 +273,15 @@ def build_agent_runtime_context(
         "bot_commit": BOT_COMMIT,
         "environment": build_agent_env_context(),
     }
+    if task_format is not None:
+        context["task_format"] = task_format
     if extra_context:
         for key, value in extra_context.items():
-            if key not in context:
+            if key not in context and key != "task_format":
                 context[key] = value
     return context
 
 
-_CUSTOMIZATION_KEY_TEXTS = frozenset({
-    'format.days_short',
-    'format.duration_unlimited',
-    'key.tariff.custom',
-    'key.status.active',
-    'key.status.expired',
-    'key.status.traffic_exhausted',
-    'key.traffic.needs_setup',
-    'key.traffic.unlimited',
-    'key.traffic.used_unlimited',
-    'key.traffic.limited',
-    'key.history.operation_with_days',
-    'key.history.operation',
-    'key.history.payment',
-    'key.history.promo_suffix',
-    'promo.auto_coupon',
-})
-_CUSTOMIZATION_PAYMENT_TEXTS = frozenset({
-    'payment.invoice.purchase_description',
-    'payment.invoice.renewal_description',
-    'payment.invoice.topup_description',
-    'payment.invoice.pay_button',
-    'payment.invoice.change_method_button',
-    'payment.invoice.stale_error',
-    'format.days_short',
-    'format.duration_unlimited',
-    'tariff.price_unset',
-    'payment.quote.promo_line',
-    'payment.quote.price_line',
-    'promo.auto_coupon',
-})
-_CUSTOMIZATION_REFERRAL_TEXTS = frozenset({
-    'format.days_short',
-    'referral.no_levels',
-    'referral.level_row',
-    'referral.balance_line',
-})
-_CUSTOMIZATION_EXPIRED_KEY_TEXTS = frozenset({
-    'key.deleted_list.item',
-    'key.deleted_list.more',
-})
-_CUSTOMIZATION_TRIAL_TEXTS = frozenset({
-    'format.days_short',
-    'format.duration_unlimited',
-    'format.traffic_gb',
-    'key.traffic.unlimited',
-    'trial.offer.summary',
-    'trial.eligibility.once_per_user',
-    'trial.eligibility.once_per_group',
-})
-
-
-def _dependent_user_ui_text_keys(page_key: str | None) -> frozenset[str] | None:
-    """Return page-adjacent fragments; ``None`` means the complete catalog."""
-    if not page_key:
-        return None
-    if page_key in {
-        'my_keys', 'my_keys_empty', 'key_details', 'key_delivery',
-        'key_delivery_partial', 'key_renewed', 'new_key_server_select',
-        'new_key_inbound_select', 'new_key_no_servers', 'key_progress',
-        'key_operation_unavailable', 'key_operation_failed',
-        'key_delivery_failed', 'key_replace_server_select',
-        'key_replace_inbound_select', 'key_replace_confirm',
-        'key_rename_prompt',
-    }:
-        return _CUSTOMIZATION_KEY_TEXTS
-    if page_key == 'referral':
-        return _CUSTOMIZATION_REFERRAL_TEXTS
-    if page_key == 'expired_keys_deleted':
-        return _CUSTOMIZATION_EXPIRED_KEY_TEXTS
-    if page_key == 'trial':
-        return _CUSTOMIZATION_TRIAL_TEXTS
-    if page_key in {
-        'main', 'prepayment', 'renew_payment', 'payment_tariff_select',
-        'payment_method_select', 'payment_method_select_renewal',
-        'payment_method_select_topup', 'payment_method_select_surcharge',
-        'qr_payment', 'crypto_payment', 'balance_payment', 'demo_payment',
-        'payment_link_renewal', 'payment_link_topup', 'payment_creating',
-        'payment_pending', 'payment_check_wait', 'payment_canceled',
-        'payment_unavailable', 'payment_minimum_unavailable',
-        'payment_order_unavailable', 'payment_failed', 'payment_completed',
-        'payment_coupon_message', 'payment_auto_completed',
-        'balance_insufficient', 'balance_topup_amount', 'balance_topup_result',
-        'balance_topup_amount_invalid',
-    }:
-        return _CUSTOMIZATION_PAYMENT_TEXTS
-    if page_key.startswith('promo_'):
-        return frozenset({
-            'payment.quote.promo_line',
-            'payment.quote.price_line',
-            'promo.auto_coupon',
-        })
-    return frozenset()
-
-
-def build_customization_sources_context(page_key: str | None = None) -> dict[str, Any]:
-    """Expose supported UI and bounded business-customization sources."""
-    from database.requests import (
-        get_all_groups,
-        get_all_tariffs,
-        get_all_trial_offers,
-        get_all_user_ui_texts,
-        get_setting,
-        get_trial_usage_scope,
-        is_trial_offer_storage_ready,
-        trial_offer_action_value,
-    )
-    from database.user_ui_text_catalog import USER_UI_TEXT_CATALOG
-
-    dependent_keys = _dependent_user_ui_text_keys(page_key)
-    ui_rows = []
-    for row in get_all_user_ui_texts():
-        if dependent_keys is not None and row['text_key'] not in dependent_keys:
-            continue
-        definition = USER_UI_TEXT_CATALOG[row["text_key"]]
-        ui_rows.append({
-            "text_key": row["text_key"],
-            "text_default": row["text_default"],
-            "text_custom": row["text_custom"],
-            "text_effective": row["text_effective"],
-            "text_format": row["text_format"],
-            "description": row["description"],
-            "placeholders": sorted(definition.render_placeholders),
-            "required_placeholders": sorted(definition.placeholders),
-            "optional_placeholders": sorted(definition.optional_placeholders),
-        })
-    trial_storage_ready = is_trial_offer_storage_ready()
-    trial_offers = []
-    trial_tariffs = []
-    if trial_storage_ready:
-        for offer in get_all_trial_offers():
-            offer_id = int(offer['offer_id'])
-            trial_offers.append({
-                'offer_id': offer_id,
-                'tariff_id': offer.get('tariff_id'),
-                'tariff_name': offer.get('tariff_name'),
-                'group_id': offer.get('group_id'),
-                'group_name': offer.get('group_name'),
-                'is_primary': bool(offer.get('is_primary')),
-                'is_enabled': bool(offer.get('is_enabled')),
-                'duration_days': int(offer.get('duration_days') or 0),
-                'traffic_limit_gb': int(offer.get('traffic_limit_gb') or 0),
-                'max_ips': int(offer.get('max_ips') or 1),
-                'created_at': offer.get('created_at'),
-                'updated_at': offer.get('updated_at'),
-                'action_type': 'internal',
-                'action_value': trial_offer_action_value(offer_id),
-            })
-        group_names = {
-            int(group['id']): group.get('name')
-            for group in get_all_groups()
-        }
-        trial_tariffs = [
-            {
-                'tariff_id': int(tariff['id']),
-                'name': tariff.get('name'),
-                'group_id': int(tariff.get('group_id') or 1),
-                'group_name': group_names.get(int(tariff.get('group_id') or 1)),
-                'is_active': bool(tariff.get('is_active')),
-                'duration_days': int(tariff.get('duration_days') or 0),
-                'traffic_limit_gb': int(tariff.get('traffic_limit_gb') or 0),
-                'max_ips': int(tariff.get('max_ips') or 1),
-            }
-            for tariff in get_all_tariffs(include_hidden=True)
-            if tariff.get('system_type') is None
-        ]
-
-    return {
-        "pages": {
-            "table": "pages",
-            "fields": [
-                "page_key",
-                "text_default",
-                "text_custom",
-                "image_default",
-                "image_custom",
-                "buttons_default",
-                "buttons_custom",
-            ],
-            "effective_rule": "each *_custom value overrides the matching *_default value",
-            "owns": "full screens, media, static buttons, and page-owned dynamic button templates",
-            "button_ordering": {
-                "row": "sparse integer sort key, not a visible row number",
-                "col": "position within the same row; at most two buttons",
-                "stock_bottom_row": 1000,
-                "relative_placement": (
-                    "copy the target button row and choose the other col"
-                ),
-                "custom_position_rule": (
-                    "explicit buttons_custom row/col is authoritative"
-                ),
-            },
-        },
-        "user_ui_texts": {
-            "table": "user_ui_texts",
-            "effective_rule": "text_custom overrides text_default when text_custom is not null",
-            "formats": ["html", "plain", "button"],
-            "scope": "page_dependencies" if page_key else "complete_catalog",
-            "page_key": page_key,
-            "catalog_size": len(USER_UI_TEXT_CATALOG),
-            "rows": ui_rows,
-        },
-        "settings": {
-            "table": "settings",
-            "keys": [
-                "key_name_prefix",
-                "my_keys_item_template",
-                "notification_text",
-                "traffic_notification_text",
-                "referral_new_ref_notification_text",
-                "referral_purchase_notification_text",
-            ],
-            "definitions": {
-                "key_name_prefix": {
-                    "value": get_setting("key_name_prefix"),
-                    "default": "Ключ",
-                    "format": "plain",
-                    "description": (
-                        "Base text for names assigned only to future keys; "
-                        "changes take effect without restart"
-                    ),
-                    "generated_name": "<trimmed prefix> <per-user sequence>",
-                    "applies_to": "new keys only",
-                    "restart_required": False,
-                    "max_effective_name_length": 30,
-                },
-            },
-        },
-        "trial_offers": {
-            "table": "trial_offers",
-            "available": trial_storage_ready,
-            "unavailable_reason": (
-                None if trial_storage_ready else "database_schema_requires_v93"
-            ),
-            "usage_scope": {
-                "setting_key": "trial_usage_scope",
-                "value": get_trial_usage_scope(),
-                "allowed_values": ["once_per_user", "once_per_group"],
-            },
-            "primary_contract": (
-                "the primary row is managed by the stock Trial subscription admin section; "
-                "customization may create, update, disable, or delete only non-primary rows"
-            ),
-            "additional_offer_fields": ["tariff_id", "is_enabled"],
-            "mutation_api": {
-                "set_usage_scope": "set_trial_usage_scope(scope)",
-                "create_additional": "create_trial_offer(tariff_id, enabled=True)",
-                "update_additional": (
-                    "update_trial_offer(offer_id, tariff_id=None, enabled=None)"
-                ),
-                "delete_additional": "delete_trial_offer(offer_id)",
-                "module": "database.requests",
-            },
-            "eligible_tariffs": trial_tariffs,
-            "offers": trial_offers,
-            "button_contract": {
-                "action_type": "internal",
-                "action_value": "cmd_trial_offer:<offer_id>",
-                "behavior": "opens the shared trial confirmation page",
-            },
-        },
-    }
-
-
-def _with_customization_sources(
-    topic_id: int,
-    context: Optional[dict[str, Any]],
-) -> dict[str, Any]:
-    result = dict(context or {})
-    if is_yadreno_admin_customization_topic(topic_id):
-        invocation = result.get('invocation')
-        page_key = invocation.get('page_key') if isinstance(invocation, dict) else None
-        result["customization_sources"] = build_customization_sources_context(page_key)
-    return result
 
 
 def _runtime_context_factory_for_turn(
@@ -517,7 +290,11 @@ def _runtime_context_factory_for_turn(
     extra_context: Optional[dict[str, Any]],
 ) -> Callable[[], dict[str, Any]]:
     """Return a builder that prefers the active pinned /yaa page snapshot."""
-    if get_yaa_page_binding(telegram_id, topic_id) is not None:
+    task_format = yadreno_admin_task_format_for_topic(topic_id)
+    if (
+        topic_id == YADRENO_ADMIN_YAA_TOPIC_ID
+        and get_yaa_page_binding(telegram_id, topic_id) is not None
+    ):
         def build_bound() -> dict[str, Any]:
             context = build_bound_yaa_runtime_context(telegram_id, topic_id)
             if context is None:
@@ -525,14 +302,18 @@ def _runtime_context_factory_for_turn(
                     "The active /yaa binding disappeared during the request"
                 )
             return build_agent_runtime_context(
-                _with_customization_sources(topic_id, context)
+                context,
+                task_format=task_format,
             )
 
         return build_bound
 
     def build_unbound() -> dict[str, Any]:
+        if is_yadreno_admin_customization_topic(topic_id):
+            return build_agent_runtime_context(task_format=task_format)
         return build_agent_runtime_context(
-            _with_customization_sources(topic_id, extra_context)
+            extra_context,
+            task_format=task_format,
         )
 
     return build_unbound
@@ -566,10 +347,38 @@ def _with_agent_runtime_context(
     )
 
 
+def normalize_yadreno_admin_api_key(api_key: str) -> str:
+    """Return a normalized HTTP-safe Bearer token without exposing its value."""
+    if not isinstance(api_key, str):
+        raise ValueError("invalid api_key format")
+
+    normalized = api_key.strip()
+    if not normalized:
+        raise ValueError("invalid api_key format")
+    if any(
+        char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F
+        for char in normalized
+    ):
+        raise ValueError("invalid api_key format")
+    if _YADRENO_ADMIN_API_KEY_RE.fullmatch(normalized) is None:
+        raise ValueError("invalid api_key format")
+    return normalized
+
+
 def _hub_headers(api_key: str) -> dict[str, str]:
     """Build authentication and version headers for every hub request."""
+    try:
+        normalized_api_key = normalize_yadreno_admin_api_key(api_key)
+    except ValueError:
+        logger.warning(
+            "Yadreno Admin request rejected locally: invalid api_key format"
+        )
+        raise YadrenoAdminError(
+            "Yadreno Admin request rejected locally: invalid api_key format",
+            kind="configuration",
+        ) from None
     return {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {normalized_api_key}",
         "X-Yadreno-Satellite-Protocol-Version": SATELLITE_PROTOCOL_VERSION,
     }
 
@@ -586,7 +395,10 @@ class YadrenoAdminError(RuntimeError):
         kind: Literal[
             "transport",
             "authentication",
+            "configuration",
             "hub_rejection",
+            "maintenance",
+            "service_unavailable",
             "protocol",
             "local",
         ] | None = None,
@@ -1018,7 +830,15 @@ def _is_retryable_hub_error(error: Exception) -> bool:
     """Return whether repeating the same HTTP operation may recover."""
     if not isinstance(error, YadrenoAdminError):
         return True
-    if error.kind in {"authentication", "hub_rejection", "protocol", "local"}:
+    if error.kind in {
+        "authentication",
+        "configuration",
+        "hub_rejection",
+        "maintenance",
+        "service_unavailable",
+        "protocol",
+        "local",
+    }:
         return False
     status_code = error.status_code
     return (
@@ -1133,6 +953,47 @@ def _incompatible_specialized_hub(
     return _incompatible_customization_hub(detail)
 
 
+def _is_temporary_hub_unavailability(error: YadrenoAdminError) -> bool:
+    """Return True for discovery failures consistent with a hub restart."""
+    if error.kind == "protocol":
+        return True
+    if error.kind != "transport":
+        return False
+    return (
+        error.status_code is None
+        or error.status_code in {408, 429}
+        or error.status_code >= 500
+    )
+
+
+def _temporary_hub_unavailable(
+    error: YadrenoAdminError,
+    operation: str,
+) -> YadrenoAdminError:
+    """Build a calm user-facing error after retryable discovery has failed."""
+    detail = error.status_code or "network_or_protocol"
+    return YadrenoAdminError(
+        f"Hub temporarily unavailable during {operation} ({detail})",
+        status_code=error.status_code,
+        user_message=HUB_TEMPORARILY_UNAVAILABLE_MESSAGE,
+        kind="service_unavailable",
+    )
+
+
+def _raise_for_capability_status(data: dict[str, Any]) -> None:
+    """Stop a new task when the authenticated hub reports maintenance."""
+    if data.get("status") != "maintenance":
+        return
+    response_text = data.get("response_text")
+    if not isinstance(response_text, str) or not response_text.strip():
+        response_text = HUB_MAINTENANCE_FALLBACK_MESSAGE
+    raise YadrenoAdminError(
+        "Hub reported maintenance during capability discovery",
+        user_message=response_text.strip(),
+        kind="maintenance",
+    )
+
+
 async def _ensure_broadcast_hub_support(
     session: aiohttp.ClientSession,
     api_key: str,
@@ -1149,13 +1010,19 @@ async def _ensure_broadcast_hub_support(
             "/api/v1/satellite/capabilities",
         )
     except YadrenoAdminError as error:
-        if error.kind == "authentication":
+        if error.kind in {"authentication", "configuration"}:
             raise
+        if _is_temporary_hub_unavailability(error):
+            raise _temporary_hub_unavailable(
+                error,
+                "broadcast capability discovery",
+            ) from error
         raise _incompatible_broadcast_hub(
             f"capability discovery failed ({error.status_code or 'network'})"
         ) from error
     if not isinstance(data, dict):
         raise _incompatible_broadcast_hub("empty capability response")
+    _raise_for_capability_status(data)
     capabilities = data.get("capabilities")
     allowed_skills = data.get("allowed_skill_ids")
     if data.get("satellite_type") != YADRENO_ADMIN_SATELLITE_TYPE:
@@ -1170,6 +1037,7 @@ async def _negotiate_runtime_context_support(
     session: aiohttp.ClientSession,
     api_key: str,
     skill_id: str,
+    negotiated_capabilities: set[str] | None = None,
 ) -> bool:
     """Discover structured context support for one new task.
 
@@ -1187,8 +1055,13 @@ async def _negotiate_runtime_context_support(
             "/api/v1/satellite/capabilities",
         )
     except YadrenoAdminError as error:
-        if error.kind == "authentication":
+        if error.kind in {"authentication", "configuration"}:
             raise
+        if _is_temporary_hub_unavailability(error):
+            raise _temporary_hub_unavailable(
+                error,
+                "capability discovery",
+            ) from error
         if skill_id == YADRENO_ADMIN_CUSTOMIZATION_SKILL_ID:
             raise _incompatible_customization_hub(
                 f"capability discovery failed ({error.status_code or 'network'})"
@@ -1203,6 +1076,7 @@ async def _negotiate_runtime_context_support(
         if skill_id == YADRENO_ADMIN_CUSTOMIZATION_SKILL_ID:
             raise _incompatible_customization_hub("empty capability response")
         return False
+    _raise_for_capability_status(data)
     capabilities = data.get("capabilities")
     allowed_skills = data.get("allowed_skill_ids")
     supported = bool(
@@ -1213,6 +1087,10 @@ async def _negotiate_runtime_context_support(
         and isinstance(allowed_skills, list)
         and skill_id in allowed_skills
     )
+    if supported and negotiated_capabilities is not None:
+        negotiated_capabilities.update(
+            item for item in capabilities if isinstance(item, str)
+        )
     if skill_id == YADRENO_ADMIN_CUSTOMIZATION_SKILL_ID and not supported:
         raise _incompatible_customization_hub("capability response mismatch")
     return supported
@@ -1253,7 +1131,7 @@ def _raise_for_hub_rejection(data: dict[str, Any], operation: str) -> None:
     raise YadrenoAdminError(
         f"Hub rejected {operation} (status={status})",
         user_message=response_text.strip(),
-        kind="hub_rejection",
+        kind="maintenance" if status == "maintenance" else "hub_rejection",
     )
 
 
@@ -1771,6 +1649,15 @@ async def _run_tool_call(
         }
         _log_tool_audit(event, result)
         return result
+    if tool in CUSTOMIZATION_TOOL_NAMES and not is_yadreno_admin_customization_topic(topic_id):
+        result = {
+            "result": "",
+            "error": (
+                f"{tool} is allowed only in customization topics 1001 and 1002"
+            ),
+        }
+        _log_tool_audit(event, result)
+        return result
 
     runtime = _runtime_context_from_event(event, topic_id=topic_id)
     _remember_tool_runtime(runtime)
@@ -1793,6 +1680,17 @@ async def _run_tool_call(
             return await _run_script(args, runtime=runtime)
         if tool == "satellite_sql":
             return await _execute_sql(args, runtime=runtime)
+        if tool in CUSTOMIZATION_TOOL_NAMES:
+            if not isinstance(args, dict):
+                return {"result": "", "error": "invalid customization tool arguments"}
+            return {
+                "result": await asyncio.to_thread(
+                    execute_customization_tool,
+                    tool,
+                    args,
+                ),
+                "error": None,
+            }
         return {"result": "", "error": f"unknown tool {tool}"}
 
     guard_error = _core_guard_integrity_error_for_tool(tool, args, topic_id=topic_id)
@@ -2023,10 +1921,12 @@ async def run_dialog(
         timeout = aiohttp.ClientTimeout(total=70)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             effective_skill_id = yadreno_admin_skill_id_for_topic(topic_id, skill_id)
+            negotiated_capabilities: set[str] = set()
             runtime_context_supported = await _negotiate_runtime_context_support(
                 session,
                 api_key,
                 effective_skill_id,
+                negotiated_capabilities,
             )
             server_ip = await _get_server_ip(session)
             core_changes_allowed = _core_policy_for_skill(effective_skill_id)
@@ -2059,6 +1959,9 @@ async def run_dialog(
                 "capabilities": _capabilities_for_skill(
                     effective_skill_id,
                     runtime_context_supported=runtime_context_supported,
+                    customization_tools_supported=(
+                        CUSTOMIZATION_TOOLS_CAPABILITY in negotiated_capabilities
+                    ),
                 ),
             }
             if runtime_context_supported:
@@ -2130,10 +2033,12 @@ async def run_dialog_with_uploads(
         timeout = aiohttp.ClientTimeout(total=70)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             effective_skill_id = yadreno_admin_skill_id_for_topic(topic_id, skill_id)
+            negotiated_capabilities: set[str] = set()
             runtime_context_supported = await _negotiate_runtime_context_support(
                 session,
                 api_key,
                 effective_skill_id,
+                negotiated_capabilities,
             )
             server_ip = await _get_server_ip(session)
             core_changes_allowed = _core_policy_for_skill(effective_skill_id)
@@ -2172,6 +2077,9 @@ async def run_dialog_with_uploads(
                 "capabilities": ",".join(_capabilities_for_skill(
                     effective_skill_id,
                     runtime_context_supported=runtime_context_supported,
+                    customization_tools_supported=(
+                        CUSTOMIZATION_TOOLS_CAPABILITY in negotiated_capabilities
+                    ),
                 )),
             }
             if runtime_context_supported:
@@ -2616,7 +2524,41 @@ async def recover_active_dialogs_on_startup(bot: Any) -> None:
     api_key = get_yadreno_admin_api_key()
     if not api_key:
         return
-    for item in list_yadreno_admin_active_requests():
+    active_requests = list_yadreno_admin_active_requests()
+    if not active_requests:
+        return
+
+    try:
+        _hub_headers(api_key)
+    except YadrenoAdminError as error:
+        if error.kind != "configuration":
+            raise
+        from bot.keyboards.admin_yadreno import yadreno_admin_chat_kb
+        from bot.utils.yadreno_admin_errors import format_yadreno_admin_error
+
+        for telegram_id in sorted({
+            int(item["telegram_id"])
+            for item in active_requests
+        }):
+            try:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text=format_yadreno_admin_error(error),
+                    reply_markup=yadreno_admin_chat_kb(
+                        YADRENO_ADMIN_CHAT_TOPIC_ID
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as delivery_error:
+                logger.warning(
+                    "Yadreno Admin configuration notice delivery failed: "
+                    "admin=%s error=%s",
+                    telegram_id,
+                    delivery_error,
+                )
+        return
+
+    for item in active_requests:
         asyncio.create_task(
             _recover_one_active_dialog_on_startup(
                 bot,

@@ -26,6 +26,7 @@ from database.requests import (
     is_cardlink_configured,
     is_cards_configured,
     is_crypto_configured,
+    is_cryptobot_configured,
     is_platega_configured,
     is_referral_enabled,
     is_stars_enabled,
@@ -154,6 +155,7 @@ def _balance_spending_enabled() -> bool:
 def _topup_provider_configured(telegram_id: int) -> bool:
     if any((
         is_crypto_configured(),
+        is_cryptobot_configured(),
         is_stars_enabled(),
         is_cards_configured(),
         is_yookassa_qr_configured(),

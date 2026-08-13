@@ -116,12 +116,10 @@ def add_server_confirm_kb() -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text='⬅️ Назад', callback_data='admin_server_add_back'), InlineKeyboardButton(text='❌ Отмена', callback_data='admin_servers'))
     return builder.as_markup()
 
-def add_server_test_failed_kb(allow_save_anyway: bool = True) -> InlineKeyboardMarkup:
+def add_server_test_failed_kb() -> InlineKeyboardMarkup:
     """Keyboard when the connection test fails."""
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text='🔄 Проверить снова', callback_data='admin_server_add_test'))
-    if allow_save_anyway:
-        builder.row(InlineKeyboardButton(text='✅ Сохранить всё равно', callback_data='admin_server_add_save'))
     builder.row(InlineKeyboardButton(text='⬅️ Назад', callback_data='admin_server_add_back'), InlineKeyboardButton(text='❌ Отмена', callback_data='admin_servers'))
     return builder.as_markup()
 

@@ -8,7 +8,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from bot.utils.text import escape_html
-from database.requests import get_all_user_ui_texts
+from database.requests import get_all_user_ui_texts, get_user_ui_text
 from database.user_ui_text_catalog import USER_UI_TEXT_CATALOG
 
 
@@ -105,6 +105,21 @@ def reload_user_ui_text_cache() -> int:
     return load_user_ui_text_cache()
 
 
+def validate_user_ui_text_custom(text_key: str, text_custom: str | None) -> None:
+    """Validate one proposed override against the stock catalog contract."""
+    row = get_user_ui_text(text_key)
+    if row is None:
+        raise KeyError(f"Unknown user UI text key: {text_key}")
+    if text_custom is not None and not isinstance(text_custom, str):
+        raise TypeError("text_custom must be a string or null")
+    candidate = dict(row)
+    candidate["text_custom"] = text_custom
+    candidate["text_effective"] = (
+        text_custom if text_custom is not None else candidate["text_default"]
+    )
+    _validate_row(candidate)
+
+
 def get_cached_user_ui_texts() -> Mapping[str, CachedUserUIText]:
     """Returns the immutable current cache for read-only runtime introspection."""
     with _CACHE_LOCK:
@@ -175,4 +190,5 @@ __all__ = [
     "reload_user_ui_text_cache",
     "render_duration_days",
     "render_ui_text",
+    "validate_user_ui_text_custom",
 ]

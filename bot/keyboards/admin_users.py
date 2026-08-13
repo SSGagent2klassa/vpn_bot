@@ -100,14 +100,7 @@ def user_view_kb(telegram_id: int, vpn_keys: List[Dict[str, Any]], is_banned: bo
     builder = InlineKeyboardBuilder()
     for key in vpn_keys:
         key_id = key['id']
-        if key.get('custom_name'):
-            key_name = key['custom_name']
-        else:
-            uuid = key.get('client_uuid') or ''
-            if len(uuid) >= 8:
-                key_name = f'{uuid[:4]}...{uuid[-4:]}'
-            else:
-                key_name = uuid or f'Ключ #{key_id}'
+        key_name = key.get('custom_name') or f'Ключ #{key_id}'
         expires_at = key.get('expires_at')
         if expires_at:
             status = '🔑'
@@ -240,22 +233,6 @@ def add_key_server_kb(servers: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
     for server in servers:
         builder.row(InlineKeyboardButton(text=f"🖥️ {server['name']}", callback_data=f"admin_add_key_server:{server['id']}"))
     builder.row(InlineKeyboardButton(text='❌ Отмена', callback_data='admin_user_add_key_cancel'))
-    return builder.as_markup()
-
-def add_key_inbound_kb(inbounds: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
-    """
-    Keyboard selection inbound for new key.
-    
-    Args:
-        inbounds: List of inbound connections
-    """
-    builder = InlineKeyboardBuilder()
-    for inbound in inbounds:
-        inbound_id = inbound.get('id')
-        protocol = inbound.get('protocol', 'unknown')
-        remark = inbound.get('remark', f'Inbound #{inbound_id}')
-        builder.row(InlineKeyboardButton(text=f'🔌 {remark} ({protocol})', callback_data=f'admin_add_key_inbound:{inbound_id}'))
-    builder.row(InlineKeyboardButton(text='⬅️ Назад', callback_data='admin_add_key_back'), InlineKeyboardButton(text='❌ Отмена', callback_data='admin_user_add_key_cancel'))
     return builder.as_markup()
 
 def add_key_step_kb(step: int) -> InlineKeyboardMarkup:

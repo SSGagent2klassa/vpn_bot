@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -12,7 +11,6 @@ from typing import Any, Dict, Iterable, List, Optional
 from bot.services.panels.base import (
     PanelClientState,
     PanelServerSnapshot,
-    build_legacy_panel_snapshot,
 )
 from bot.services.panel_key_state import should_panel_client_exist
 from bot.utils.panel_email import is_managed_panel_email
@@ -149,7 +147,7 @@ async def collect_server_snapshots(
     allowed_server_ids: Optional[Iterable[int]] = None,
 ) -> SnapshotCollection:
     """Download one complete snapshot for every server represented by keys."""
-    from bot.services.vpn_api import get_client_from_server_data, is_subscription_mode
+    from bot.services.vpn_api import get_client_from_server_data
 
     grouped = group_keys_by_server(keys)
     servers_by_id = _server_map(servers)
@@ -171,40 +169,7 @@ async def collect_server_snapshots(
         async with semaphore:
             try:
                 client = get_client_from_server_data(server)
-                subscription_mode = is_subscription_mode()
-                snapshot_method = getattr(client, "get_sync_snapshot", None)
-                if callable(snapshot_method):
-                    snapshot_result = snapshot_method(
-                        subscription_mode=subscription_mode,
-                    )
-                    snapshot = (
-                        await snapshot_result
-                        if inspect.isawaitable(snapshot_result)
-                        else snapshot_result
-                    )
-                else:
-                    # Keep third-party/older adapters and lightweight test doubles
-                    # compatible: their complete inbound list is already a valid
-                    # one-request legacy snapshot.
-                    inbounds_method = (
-                        getattr(client, "get_subscription_inbounds", None)
-                        if subscription_mode
-                        else None
-                    ) or getattr(client, "get_inbounds", None)
-                    if not callable(inbounds_method):
-                        raise RuntimeError("Panel adapter does not support batch snapshots")
-                    try:
-                        inbounds_result = inbounds_method(include_ignored=True)
-                    except TypeError:
-                        inbounds_result = inbounds_method()
-                    inbounds = (
-                        await inbounds_result
-                        if inspect.isawaitable(inbounds_result)
-                        else inbounds_result
-                    )
-                    snapshot = build_legacy_panel_snapshot(
-                        list(inbounds or []),
-                    )
+                snapshot = await client.get_sync_snapshot()
                 if not isinstance(snapshot, PanelServerSnapshot):
                     raise RuntimeError("Panel adapter returned an invalid batch snapshot")
                 collection.snapshots[server_id] = snapshot
@@ -227,14 +192,7 @@ async def _apply_clients_api_bulk_prelude(
     snapshot: PanelServerSnapshot,
 ) -> Dict[str, Dict[str, int]]:
     """Batch membership and enabled-state changes before point reconciliation."""
-    if snapshot.api_profile != "clients_api":
-        return {}
-
-    from bot.services.vpn_api import (
-        get_client_from_server_data,
-        is_subscription_mode,
-    )
-    from bot.utils.inbounds import is_ignored_inbound
+    from bot.services.vpn_api import get_client_from_server_data
 
     client = get_client_from_server_data(server)
     required_methods = (
@@ -257,9 +215,8 @@ async def _apply_clients_api_bulk_prelude(
     visible_ids = {
         int(inbound["id"])
         for inbound in snapshot.inbounds
-        if inbound.get("id") is not None and not is_ignored_inbound(inbound)
+        if inbound.get("id") is not None
     }
-    subscription_mode = is_subscription_mode()
     attach_groups: Dict[tuple[int, ...], List[str]] = {}
     detach_groups: Dict[tuple[int, ...], List[str]] = {}
     delete_emails: List[str] = []
@@ -298,29 +255,9 @@ async def _apply_clients_api_bulk_prelude(
 
         current_ids = set(state.inbound_ids)
 
-        if subscription_mode:
-            desired_ids = set(visible_ids)
-        else:
-            try:
-                configured_id = int(key.get("panel_inbound_id"))
-            except (TypeError, ValueError):
-                configured_id = None
-            if configured_id in snapshot.unavailable_inbound_ids:
-                continue
-            current_visible = current_ids.intersection(visible_ids)
-            if configured_id in visible_ids:
-                desired_ids = {configured_id}
-            elif current_visible:
-                desired_ids = {min(current_visible)}
-            else:
-                desired_ids = set()
+        desired_ids = set(visible_ids)
 
-        if not desired_ids and current_ids:
-            if has_unavailable_memberships:
-                inbound_ids = tuple(sorted(current_ids))
-                detach_groups.setdefault(inbound_ids, []).append(email)
-            else:
-                delete_emails.append(email)
+        if not desired_ids:
             continue
 
         missing_ids = tuple(sorted(desired_ids - current_ids))
@@ -339,16 +276,10 @@ async def _apply_clients_api_bulk_prelude(
     operation_metrics = client.operation_metrics("bulk_reconcile")
     async with operation_metrics:
         for inbound_ids, emails in attach_groups.items():
-            known_states = {
-                email: states_by_email[email.lower()]
-                for email in emails
-                if email.lower() in states_by_email
-            }
             try:
                 confirmed = await client.bulk_attach_clients(
                     emails,
                     inbound_ids,
-                    known_states=known_states,
                 )
             except Exception as exc:
                 logger.warning(
@@ -747,7 +678,7 @@ async def run_db_to_panel_sync(
 
         plan.successful_server_ids.append(server_id)
         bulk_stats_by_email: Dict[str, Dict[str, int]] = {}
-        if apply and snapshot.api_profile == "clients_api":
+        if apply:
             try:
                 bulk_stats_by_email = await _apply_clients_api_bulk_prelude(
                     server,

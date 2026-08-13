@@ -9,13 +9,14 @@ def _status_dot(enabled: bool) -> str:
     """Status indicator for row buttons."""
     return '🟢' if enabled else '⚪'
 
-def payments_menu_kb(stars_enabled: bool, crypto_enabled: bool, cards_enabled: bool, qr_enabled: bool=False, demo_enabled: bool=False, wata_enabled: bool=False, platega_enabled: bool=False, cardlink_enabled: bool=False, notify_enabled: bool=False) -> InlineKeyboardMarkup:
+def payments_menu_kb(stars_enabled: bool, crypto_enabled: bool, cards_enabled: bool, qr_enabled: bool=False, demo_enabled: bool=False, wata_enabled: bool=False, platega_enabled: bool=False, cardlink_enabled: bool=False, notify_enabled: bool=False, cryptobot_enabled: bool=False) -> InlineKeyboardMarkup:
     """
     Main menu of the payments section.
 
     Args:
         stars_enabled: Is Telegram Stars enabled?
-        crypto_enabled: Whether crypto payments are enabled
+        crypto_enabled: Whether legacy Ya.Seller payments are enabled
+        cryptobot_enabled: Whether Crypto Pay is enabled
         cards_enabled: Whether TG payments are enabled (historical internal name cards)
         qr_enabled: Is YuKass direct payment enabled?
         demo_enabled: Is demo payment enabled?
@@ -26,11 +27,16 @@ def payments_menu_kb(stars_enabled: bool, crypto_enabled: bool, cards_enabled: b
     """
     builder = InlineKeyboardBuilder()
     stars_status = _status_dot(stars_enabled)
-    crypto_status = _status_dot(crypto_enabled)
+    cryptobot_status = _status_dot(cryptobot_enabled)
     builder.row(
         InlineKeyboardButton(text=f'{stars_status} Telegram Stars', callback_data='admin_payments_toggle_stars'),
-        InlineKeyboardButton(text=f'{crypto_status} Крипто-платежи', callback_data='admin_payments_toggle_crypto'),
+        InlineKeyboardButton(text=f'{cryptobot_status} Crypto Pay', callback_data='admin_payments_cryptobot'),
     )
+    if crypto_enabled:
+        builder.row(InlineKeyboardButton(
+            text='🟢 Ya.Seller',
+            callback_data='admin_payments_toggle_crypto',
+        ))
     cards_status = _status_dot(cards_enabled)
     qr_status = _status_dot(qr_enabled)
     builder.row(
@@ -166,6 +172,24 @@ def cardlink_management_kb(is_enabled: bool) -> InlineKeyboardMarkup:
     ))
     builder.row(InlineKeyboardButton(text='🆔 Изменить Shop ID', callback_data='admin_cardlink_mgmt_edit_shop_id'))
     builder.row(InlineKeyboardButton(text='🔐 Изменить API-токен', callback_data='admin_cardlink_mgmt_edit_api_token'))
+    builder.row(back_button('admin_payments'), home_button())
+    return builder.as_markup()
+
+
+def cryptobot_management_kb(is_enabled: bool) -> InlineKeyboardMarkup:
+    """Administrator controls for the built-in Crypto Pay provider."""
+    builder = InlineKeyboardBuilder()
+    builder.row(*state_pair_buttons(
+        is_enabled,
+        'Включено',
+        'admin_cryptobot_mgmt_set:1',
+        'Выключено',
+        'admin_cryptobot_mgmt_set:0',
+    ))
+    builder.row(InlineKeyboardButton(
+        text='🔐 Изменить API-токен',
+        callback_data='admin_cryptobot_mgmt_edit_token',
+    ))
     builder.row(back_button('admin_payments'), home_button())
     return builder.as_markup()
 

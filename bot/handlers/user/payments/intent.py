@@ -17,12 +17,14 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from bot.services.payment_intents import (
     PURPOSE_KEY_PURCHASE,
     PURPOSE_KEY_RENEWAL,
-    cancel_payment_intent,
     create_payment_intent,
     format_base_minor,
     load_payment_intent,
     quote_payment_intent,
-    restart_payment_intent_for_method_change,
+)
+from bot.services.payment_provider_cancellation import (
+    cancel_payment_intent_safely,
+    restart_payment_intent_safely,
 )
 from bot.services.payment_provider_adapters import (
     check_provider_invoice,
@@ -216,11 +218,28 @@ async def payment_intent_methods_handler(
     if not intent:
         return
 
-    replacement = restart_payment_intent_for_method_change(
+    result = await restart_payment_intent_safely(
         intent.order_id,
         user_id=intent.user_id,
     )
-    if replacement is None:
+    if result.outcome == 'succeeded':
+        await _complete_intent(
+            callback,
+            state,
+            intent.order_id,
+            payment_type=intent.payment_type or 'cryptobot',
+            referral_amount=0,
+        )
+        return
+    if result.outcome == 'uncertain':
+        await _render_callback_page(
+            callback,
+            'payment_failed',
+            order_id=intent.order_id,
+        )
+        return
+    replacement = result.replacement
+    if result.outcome != 'restarted' or replacement is None:
         await _render_callback_page(callback, "payment_order_unavailable")
         return
     callback_answered = await start_payment_intent_method_selection(
@@ -239,7 +258,27 @@ async def payment_intent_cancel_handler(callback: CallbackQuery, state: FSMConte
     intent = await _owned_intent(callback)
     if not intent:
         return
-    if not cancel_payment_intent(intent.order_id, user_id=intent.user_id):
+    result = await cancel_payment_intent_safely(
+        intent.order_id,
+        user_id=intent.user_id,
+    )
+    if result.outcome == 'succeeded':
+        await _complete_intent(
+            callback,
+            state,
+            intent.order_id,
+            payment_type=intent.payment_type or 'cryptobot',
+            referral_amount=0,
+        )
+        return
+    if result.outcome == 'uncertain':
+        await _render_callback_page(
+            callback,
+            'payment_failed',
+            order_id=intent.order_id,
+        )
+        return
+    if result.outcome != 'canceled':
         await _render_callback_page(callback, "payment_order_unavailable")
         return
 
@@ -376,13 +415,27 @@ async def payment_intent_provider_handler(
         )
         return
 
-    bot_info = await callback.bot.get_me()
-    invoice = await create_provider_invoice(
-        load_payment_intent(intent.order_id) or intent,
-        quote,
-        telegram_id=callback.from_user.id,
-        bot_username=bot_info.username or '',
-    )
+    try:
+        bot_info = await callback.bot.get_me()
+        invoice = await create_provider_invoice(
+            load_payment_intent(intent.order_id) or intent,
+            quote,
+            telegram_id=callback.from_user.id,
+            bot_username=bot_info.username or '',
+        )
+    except Exception as error:
+        logger.warning(
+            'Payment invoice creation failed order=%s provider=%s: %s',
+            intent.order_id,
+            adapter.provider_id,
+            error,
+        )
+        await _render_callback_page(
+            callback,
+            'payment_failed',
+            order_id=intent.order_id,
+        )
+        return
     if invoice.status == 'succeeded':
         await _complete_intent(
             callback,
@@ -721,6 +774,7 @@ def _balance_spending_enabled() -> bool:
 def _provider_minimum(adapter) -> int:
     minimums = {
         'crypto': 1,
+        'cryptobot': 1,
         'stars': 1,
         'cards': 10000,
         'yookassa_qr': 100,

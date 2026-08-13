@@ -37,9 +37,9 @@ async def _render_buy_page(target):
         target: Message or CallbackQuery
     """
     from database.requests import (
-        is_crypto_configured, is_stars_enabled, is_cards_enabled,
-        is_yookassa_qr_configured, is_wata_configured, is_platega_configured,
-        is_cardlink_configured,
+        is_crypto_configured, is_cryptobot_configured, is_stars_enabled,
+        is_cards_enabled, is_yookassa_qr_configured, is_wata_configured,
+        is_platega_configured, is_cardlink_configured,
         is_demo_payment_enabled,
         get_all_tariffs,
         get_user_internal_id,
@@ -52,6 +52,7 @@ async def _render_buy_page(target):
         telegram_id = target.from_user.id
 
     crypto_configured = is_crypto_configured()
+    cryptobot_configured = is_cryptobot_configured()
     stars_enabled = is_stars_enabled()
     cards_enabled = is_cards_enabled()
     yookassa_qr = is_yookassa_qr_configured()
@@ -61,7 +62,7 @@ async def _render_buy_page(target):
     demo_enabled = is_demo_payment_enabled()
 
     # Verification: at least one payment method is configured
-    if not crypto_configured and not stars_enabled and not cards_enabled and not yookassa_qr and not wata_enabled and not platega_enabled and not cardlink_enabled and not demo_enabled:
+    if not crypto_configured and not cryptobot_configured and not stars_enabled and not cards_enabled and not yookassa_qr and not wata_enabled and not platega_enabled and not cardlink_enabled and not demo_enabled:
         await render_page(
             target,
             page_key='prepayment_unavailable',

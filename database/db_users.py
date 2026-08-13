@@ -24,6 +24,7 @@ __all__ = [
     'get_all_users_paginated',
     'get_user_by_id',
     'get_user_by_telegram_id',
+    'get_user_snapshot_profile',
     'get_user_by_username',
     'toggle_user_ban',
     'get_new_users_count_today',
@@ -403,6 +404,34 @@ def get_user_by_telegram_id(telegram_id: int) -> Optional[Dict[str, Any]]:
         )
         row = cursor.fetchone()
         return dict(row) if row else None
+
+
+def get_user_snapshot_profile(telegram_id: int) -> Optional[Dict[str, Any]]:
+    """Returns only the user columns approved for the extension snapshot."""
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                id,
+                telegram_id,
+                username,
+                first_name,
+                last_name,
+                is_banned,
+                is_bot_blocked,
+                created_at,
+                used_trial,
+                referral_code,
+                referred_by,
+                personal_balance,
+                referral_coefficient
+            FROM users
+            WHERE telegram_id = ?
+            """,
+            (int(telegram_id),),
+        ).fetchone()
+    return dict(row) if row else None
+
 
 def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
     """

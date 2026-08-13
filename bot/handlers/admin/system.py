@@ -23,13 +23,16 @@ from bot.utils.git_utils import (
     get_remote_url,
     set_remote_url,
     check_for_updates,
+    pull_updates,
+    force_pull_updates,
     get_last_commit_info,
     get_previous_commits_info,
+    install_requirements,
+    restart_bot,
 )
 from bot.version import BOT_COMMIT, BOT_RELEASE
 from bot.keyboards.admin import (
     bot_settings_kb,
-    bot_mode_toggle_confirm_kb,
     extensions_diagnostics_kb,
     update_confirm_kb,
     update_rollback_entry_kb,
@@ -50,7 +53,6 @@ from bot.services.yadreno_admin import (
     get_active_request_id,
     run_dialog_with_uploads,
 )
-from bot.services.panel_sync_coordinator import regular_panel_operation
 from bot.services.update_rollback import (
     UpdateRollbackError,
     get_current_version_identity,
@@ -65,7 +67,11 @@ from database.requests import get_yadreno_admin_api_key, set_setting
 logger = logging.getLogger(__name__)
 
 from bot.utils.text import escape_html, get_message_text_for_storage, safe_edit_or_send
-from bot.utils.update_block import is_update_blocked, get_blocked_message, try_unblock
+from bot.utils.update_block import (
+    get_blocked_message,
+    is_update_blocked,
+    try_unblock,
+)
 from bot.utils.yadreno_admin_errors import format_yadreno_admin_error
 
 router = Router()
@@ -122,62 +128,15 @@ async def show_bot_settings(callback: CallbackQuery, state: FSMContext):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
 
-    from bot.services.vpn_api import get_bot_mode
-    mode = get_bot_mode()
-    if mode == 'subscription':
-        mode_label = "📡 Подписка"
-        mode_desc = (
-            "Бот выдаёт пользователю одну <b>subscription-ссылку</b> — "
-            "клиент сам подтягивает все протоколы сервера."
-        )
-    else:
-        mode_label = "🔑 Ключи"
-        mode_desc = (
-            "Бот создаёт один VLESS/VMess-клиент в одном inbound "
-            "и выдаёт ссылку + JSON-конфиг."
-        )
-
     text = (
         "⚙️ <b>Настройки бота</b>\n\n"
-        f"<b>Режим работы:</b> {mode_label}\n"
-        f"<i>{mode_desc}</i>\n\n"
         "Выберите действие:"
     )
 
     await safe_edit_or_send(callback.message,
         text,
-        reply_markup=bot_settings_kb(mode)
+        reply_markup=bot_settings_kb()
     )
-    await callback.answer()
-
-
-async def _show_bot_mode_confirm(callback: CallbackQuery, target: str):
-    """Shows confirmation of switching the bot's operating mode."""
-    if target == 'subscription':
-        warning = (
-            "⚠️ <b>Переключение в режим Подписка</b>\n\n"
-            "При ближайших синхронизациях (≈раз в 30 минут) бот:\n"
-            "• создаст клиентов во всех inbound каждого сервера для существующих ключей "
-            "(с единым subId и email);\n"
-            "• новые ключи будут выдаваться как <b>subscription URL</b>.\n\n"
-            "Текущие пользователи продолжат работать со старыми ссылками "
-            "до их замены или продления.\n\n"
-            "Продолжить?"
-        )
-    else:
-        warning = (
-            "⚠️ <b>Переключение в режим Ключи</b>\n\n"
-            "При ближайших синхронизациях бот:\n"
-            "• оставит на каждом сервере по одному клиенту (в inbound с минимальным id) "
-            "на каждый ключ;\n"
-            "• остальных клиентов с тем же email — <b>удалит</b>;\n"
-            "• новые ключи будут выдаваться как одна VLESS/VMess-ссылка.\n\n"
-            "<b>Subscription URL у пользователей перестанут работать.</b>\n\n"
-            "Продолжить?"
-        )
-
-    await safe_edit_or_send(callback.message, warning,
-                            reply_markup=bot_mode_toggle_confirm_kb(target))
     await callback.answer()
 
 
@@ -690,67 +649,6 @@ def _short_button_label(label: str, limit: int = 34) -> str:
     return text[:limit - 1].rstrip() + '…'
 
 
-@router.callback_query(F.data.startswith("admin_select_bot_mode:"))
-async def admin_select_bot_mode(callback: CallbackQuery, state: FSMContext):
-    """Opens confirmation only when selecting another mode."""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
-
-    target = callback.data.split(":", 1)[1]
-    if target not in ('subscription', 'key'):
-        await callback.answer("⛔ Недопустимое значение", show_alert=True)
-        return
-
-    from bot.services.vpn_api import get_bot_mode
-    current = get_bot_mode()
-    if target == current:
-        label = "📡 Подписка" if target == 'subscription' else "🔑 Ключи"
-        await callback.answer(f"Режим уже выбран: {label}")
-        return
-
-    await _show_bot_mode_confirm(callback, target)
-
-
-@router.callback_query(F.data == "admin_toggle_bot_mode")
-async def admin_toggle_bot_mode(callback: CallbackQuery, state: FSMContext):
-    """Compatible toggle for old posts."""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
-
-    from bot.services.vpn_api import get_bot_mode
-    current = get_bot_mode()
-    target = 'key' if current == 'subscription' else 'subscription'
-    await _show_bot_mode_confirm(callback, target)
-
-
-@router.callback_query(F.data.startswith("admin_set_bot_mode:"))
-@regular_panel_operation
-async def admin_set_bot_mode(callback: CallbackQuery, state: FSMContext):
-    """Saves the new bot operating mode in settings."""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
-
-    target = callback.data.split(":", 1)[1]
-    if target not in ('subscription', 'key'):
-        await callback.answer("⛔ Недопустимое значение", show_alert=True)
-        return
-
-    from database.db_settings import set_setting
-    set_setting('bot_mode', target)
-    logger.info(
-        f"Bot mode переключён в '{target}' администратором {callback.from_user.id}"
-    )
-    label = "📡 Подписка" if target == 'subscription' else "🔑 Ключи"
-    await callback.answer(f"✅ Режим установлен: {label}", show_alert=True)
-    await show_bot_settings(callback, state)
-
-
-
-
-
 
 # ============================================================================
 # MANUAL UPDATE OF THE BOT (COMMAND /UPDATE)
@@ -769,40 +667,45 @@ async def admin_update_cmd(message: Message, state: FSMContext):
         
     await safe_edit_or_send(message,
         "🔄 <b>Экстренное обновление...</b>\n\n"
-        "Проверяю базу данных и подготавливаю безопасное обновление..."
+        "Загружаю изменения с GitHub..."
     )
 
-    target = f"origin/{get_current_branch() or 'main'}"
     success, detail = await asyncio.to_thread(
-        schedule_admin_update,
+        pull_updates,
         update_mode="admin_emergency",
-        target=target,
-        strategy="pull",
-        admin_id=message.from_user.id,
         actor=f"telegram_admin:{message.from_user.id}",
     )
 
     if not success:
         await safe_edit_or_send(message,
-            "⚠️ <b>Обновление не началось</b>\n\n"
-            f"{escape_html(detail)}\n\n"
-            "Текущая версия продолжает работать."
+            f"❌ <b>Ошибка обновления</b>\n\n{detail}"
         )
         return
 
     logger.info(
-        "Managed emergency update %s scheduled by administrator %s",
-        detail,
+        "Bot directly updated through /update by administrator %s",
         message.from_user.id,
     )
     await safe_edit_or_send(message,
-        "🔄 <b>Обновление запущено</b>\n\n"
-        f"Snapshot: <code>{escape_html(detail)}</code>\n\n"
-        "Бот временно перезапустится. Итог придёт отдельным сообщением "
-        "только после проверки миграций и стабильного запуска.",
+        f"✅ <b>Обновление завершено!</b>\n\n{detail}\n\n"
+        "🔄 Перезапуск бота через 2 секунды...",
         force_new=True
     )
     await state.clear()
+    await asyncio.sleep(2)
+
+    success, requirements_detail = await asyncio.to_thread(install_requirements)
+    if not success:
+        logger.error("Cannot install dependencies after /update: %s", requirements_detail)
+        await safe_edit_or_send(
+            message,
+            f"⚠️ <b>Ошибка установки зависимостей</b>\n\n{requirements_detail}\n\n"
+            "Бот не будет перезапущен. Используйте ручной откат при необходимости.",
+            force_new=True,
+        )
+        return
+
+    restart_bot()
 
 
 # ============================================================================
@@ -1167,6 +1070,9 @@ async def show_force_overwrite(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
+
+    if await _reject_blocked_force_overwrite(callback):
+        return
     
     # Checking if GitHub is configured
     if not GITHUB_REPO_URL:
@@ -1189,11 +1095,29 @@ async def show_force_overwrite(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+async def _reject_blocked_force_overwrite(callback: CallbackQuery) -> bool:
+    """Render the installed update block for every force-overwrite entry."""
+    try_unblock()
+    if not is_update_blocked():
+        return False
+
+    await safe_edit_or_send(
+        callback.message,
+        get_blocked_message(),
+        reply_markup=back_and_home_kb("admin_bot_settings"),
+    )
+    await callback.answer("Обновления приостановлены", show_alert=True)
+    return True
+
+
 @router.callback_query(F.data == "admin_force_overwrite_confirm")
 async def force_overwrite_confirmed(callback: CallbackQuery, state: FSMContext):
     """Performs a forced rewrite and restart of the bot."""
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    if await _reject_blocked_force_overwrite(callback):
         return
     
     # Check and update remote URL if necessary
@@ -1206,55 +1130,49 @@ async def force_overwrite_confirmed(callback: CallbackQuery, state: FSMContext):
         "Связываюсь с репозиторием и проверяю обновления..."
     )
     
-    # Checking for blocking commits before rewriting
-    from bot.utils.git_utils import get_pending_commits_list, find_first_blocking_commit
-    
-    success_fetch, pending_commits = get_pending_commits_list()
-    blocking_commit = find_first_blocking_commit(pending_commits) if success_fetch else None
-
-    if blocking_commit:
-        target = blocking_commit['hash']
-        update_mode = "admin_force_blocking"
-        block_updates = True
-    else:
-        target = f"origin/{get_current_branch() or 'main'}"
-        update_mode = "admin_force"
-        block_updates = False
-
     success, detail = await asyncio.to_thread(
-        schedule_admin_update,
-        update_mode=update_mode,
-        target=target,
-        strategy="reset",
-        admin_id=callback.from_user.id,
+        force_pull_updates,
+        update_mode="admin_force",
         actor=f"telegram_admin:{callback.from_user.id}",
-        clean_untracked=True,
-        block_updates=block_updates,
     )
+
     if not success:
         await safe_edit_or_send(
             callback.message,
-            "⚠️ <b>Перезапись не началась</b>\n\n"
-            f"{escape_html(detail)}\n\n"
-            "Текущая версия продолжает работать.",
+            f"❌ <b>Ошибка перезаписи</b>\n\n{detail}",
             reply_markup=back_and_home_kb("admin_bot_settings"),
         )
         await callback.answer()
         return
 
     logger.info(
-        "Managed force update %s scheduled by administrator %s",
-        detail,
+        "Bot directly overwritten by administrator %s",
         callback.from_user.id,
     )
     await safe_edit_or_send(
         callback.message,
-        "🔄 <b>Безопасная перезапись запущена</b>\n\n"
-        f"Snapshot: <code>{escape_html(detail)}</code>\n\n"
-        "Итог придёт отдельным сообщением после проверки базы данных и запуска."
+        f"✅ <b>Перезапись завершена!</b>\n\n{detail}\n\n"
+        "🔄 Перезапуск бота через 2 секунды...\n"
+        "Если новая версия не запустится, используйте ручной откат."
     )
-    await callback.answer("Безопасная перезапись запущена", show_alert=True)
+    await callback.answer("Бот перезапускается...", show_alert=True)
     await state.clear()
+    await asyncio.sleep(2)
+
+    success, requirements_detail = await asyncio.to_thread(install_requirements)
+    if not success:
+        logger.error(
+            "Cannot install dependencies after force overwrite: %s",
+            requirements_detail,
+        )
+        await safe_edit_or_send(
+            callback.message,
+            f"⚠️ <b>Ошибка установки зависимостей</b>\n\n{requirements_detail}\n\n"
+            "Бот не будет перезапущен. Используйте ручной откат при необходимости.",
+        )
+        return
+
+    restart_bot()
 
 
 # ============================================================================
@@ -1855,12 +1773,13 @@ async def send_log_to_yadreno_admin(callback: CallbackQuery, state: FSMContext):
             reply_markup=yadreno_admin_request_error_kb(
                 YADRENO_ADMIN_CHAT_TOPIC_ID,
                 active_request=(
-                    get_active_request_id(
+                    e.kind != "configuration"
+                    and get_active_request_id(
                         callback.from_user.id,
                         topic_id=YADRENO_ADMIN_CHAT_TOPIC_ID,
-                    )
-                    is not None
+                    ) is not None
                 ),
+                configuration_error=(e.kind == "configuration"),
             ),
         )
 

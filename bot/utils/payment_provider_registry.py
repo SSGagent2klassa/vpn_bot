@@ -22,6 +22,7 @@ _RESERVED_PROVIDER_IDS = {
     'cards',
     'cardlink',
     'crypto',
+    'cryptobot',
     'demo',
     'platega',
     'promo_free',

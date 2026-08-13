@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -13,6 +13,7 @@ from database.requests import (
     is_cardlink_configured,
     is_cards_configured,
     is_crypto_configured,
+    is_cryptobot_configured,
     is_demo_payment_enabled,
     is_platega_configured,
     is_stars_enabled,
@@ -55,6 +56,14 @@ class ProviderInvoice:
 _ALL_PURPOSES = frozenset({'key_purchase', 'key_renewal', 'balance_topup'})
 _BUILTIN_ADAPTERS: Mapping[str, PaymentProviderAdapter] = MappingProxyType({
     'crypto': PaymentProviderAdapter('crypto', 'crypto', 'USDT', '🪙 USDT', 'link', _ALL_PURPOSES),
+    'cryptobot': PaymentProviderAdapter(
+        'cryptobot',
+        'cryptobot',
+        'Crypto Pay',
+        '💎 CryptoBot',
+        'link',
+        _ALL_PURPOSES,
+    ),
     'stars': PaymentProviderAdapter('stars', 'stars', 'Telegram Stars', '⭐ Telegram Stars', 'telegram_invoice', _ALL_PURPOSES),
     'cards': PaymentProviderAdapter('cards', 'cards', 'TG Payments', '💳 TG Payments', 'telegram_invoice', _ALL_PURPOSES),
     'yookassa_qr': PaymentProviderAdapter('yookassa_qr', 'yookassa_qr', 'ЮКасса', '📱 ЮКасса', 'link', _ALL_PURPOSES),
@@ -76,6 +85,7 @@ def _builtin_provider_availability() -> dict[str, bool]:
     """Return current core-provider configuration without UI resolvers."""
     return {
         'crypto': is_crypto_configured(),
+        'cryptobot': is_cryptobot_configured(),
         'stars': is_stars_enabled(),
         'cards': is_cards_configured(),
         'yookassa_qr': is_yookassa_qr_configured(),
@@ -235,6 +245,81 @@ async def create_provider_invoice(
     if adapter.presentation == 'placeholder':
         raise ValueError('Placeholder provider does not create invoices')
 
+    if adapter.provider_id == 'cryptobot':
+        from bot.services.cryptobot import cryptobot_lifecycle_lock
+
+        async with cryptobot_lifecycle_lock():
+            existing = get_payment_provider_order(intent.order_id)
+            if existing is not None:
+                return _existing_cryptobot_invoice(
+                    adapter,
+                    intent,
+                    quote,
+                    existing,
+                )
+            if not is_cryptobot_configured():
+                raise ValueError('Crypto Pay is disabled or not configured')
+            return await _create_provider_invoice_bound(
+                adapter,
+                intent,
+                quote,
+                telegram_id=telegram_id,
+                bot_username=bot_username,
+            )
+    return await _create_provider_invoice_bound(
+        adapter,
+        intent,
+        quote,
+        telegram_id=telegram_id,
+        bot_username=bot_username,
+    )
+
+
+def _existing_cryptobot_invoice(
+    adapter: PaymentProviderAdapter,
+    intent: PaymentIntent,
+    quote: PaymentQuote,
+    provider_order: Mapping[str, Any],
+) -> ProviderInvoice:
+    """Return an already persisted invoice instead of creating a duplicate."""
+    if str(provider_order.get('provider_id') or '') != adapter.provider_id:
+        raise ValueError('Payment intent is already bound to another provider')
+    status = _normalize_status(provider_order.get('status'))
+    if status == 'canceled':
+        raise ValueError('Crypto Pay invoice is already canceled')
+    external_id = str(provider_order.get('provider_payment_id') or '').strip()
+    payment_url = str(provider_order.get('payment_url') or '').strip()
+    charge_amount = str(provider_order.get('charge_amount') or '').strip()
+    charge_currency = str(provider_order.get('charge_currency') or '').upper()
+    if (
+        not external_id
+        or not payment_url
+        or charge_amount != _decimal_text(quote.charge_amount)
+        or charge_currency != str(quote.charge_currency or '').upper()
+    ):
+        raise ValueError('Crypto Pay persisted invoice snapshot is inconsistent')
+    return ProviderInvoice(
+        order_id=intent.order_id,
+        provider_id=adapter.provider_id,
+        payment_type=adapter.payment_type,
+        presentation=adapter.presentation,
+        status=status,
+        payment_url=payment_url,
+        provider_payment_id=external_id,
+        metadata=MappingProxyType(dict(provider_order.get('metadata') or {})),
+    )
+
+
+async def _create_provider_invoice_bound(
+    adapter: PaymentProviderAdapter,
+    intent: PaymentIntent,
+    quote: PaymentQuote,
+    *,
+    telegram_id: int,
+    bot_username: str,
+) -> ProviderInvoice:
+    """Create and persist an invoice after adapter validation and locking."""
+
     if adapter.custom:
         result = await _create_custom_invoice(
             adapter,
@@ -317,6 +402,7 @@ async def check_provider_invoice(intent: PaymentIntent) -> str:
     if not adapter or intent.purpose not in adapter.supported_purposes:
         raise ValueError('Provider is not allowed for this payment purpose')
     external_id = str(provider_order.get('provider_payment_id') or '')
+    metadata_update: dict[str, Any] | None = None
 
     if adapter.custom:
         from bot.services.custom_payments import check_custom_payment_order
@@ -342,9 +428,61 @@ async def check_provider_invoice(intent: PaymentIntent) -> str:
             order,
         )
         status = _normalize_status(result.get('status'))
+    elif adapter.provider_id == 'cryptobot':
+        from bot.services.cryptobot import (
+            check_cryptobot_invoice,
+            cryptobot_lifecycle_lock,
+        )
+
+        async with cryptobot_lifecycle_lock():
+            if not external_id:
+                raise ValueError('Crypto Pay invoice id is missing')
+            raw_expected_amount = provider_order.get('charge_amount')
+            expected_currency = str(provider_order.get('charge_currency') or '').upper()
+            try:
+                expected_amount = Decimal(str(raw_expected_amount))
+            except (InvalidOperation, TypeError, ValueError) as error:
+                raise ValueError(
+                    'Crypto Pay immutable charge snapshot is invalid'
+                ) from error
+            intent_currency = str(intent.charge_currency or '').upper()
+            if (
+                not expected_amount.is_finite()
+                or expected_amount <= 0
+                or intent.charge_amount is None
+                or expected_amount != intent.charge_amount
+                or expected_currency not in {'RUB', 'USD'}
+                or expected_currency != intent_currency
+                or str(provider_order.get('payment_type') or '') != 'cryptobot'
+                or str(provider_order.get('purpose') or '') != intent.purpose
+            ):
+                raise ValueError('Crypto Pay immutable charge snapshot is missing')
+            stored_metadata = dict(provider_order.get('metadata') or {})
+            stored_metadata_id = str(stored_metadata.get('invoice_id') or '').strip()
+            if stored_metadata_id and stored_metadata_id != external_id:
+                raise ValueError('Crypto Pay persisted invoice id is inconsistent')
+            checked = await check_cryptobot_invoice(
+                invoice_id=external_id,
+                order_id=intent.order_id,
+                amount=expected_amount,
+                fiat=expected_currency,
+            )
+            status = checked.status
+            metadata_update = stored_metadata
+            metadata_update.update(dict(checked.metadata))
+            update_payment_provider_order_status(
+                intent.order_id,
+                status,
+                metadata=metadata_update,
+            )
+            return status
     else:
         status = await _check_builtin_status(adapter, external_id, intent.order_id)
-    update_payment_provider_order_status(intent.order_id, status)
+    update_payment_provider_order_status(
+        intent.order_id,
+        status,
+        metadata=metadata_update,
+    )
     return status
 
 
@@ -386,6 +524,15 @@ async def _create_builtin_link_invoice(
             'status': 'pending',
             'metadata': {'push_confirmation': True},
         }
+    if adapter.provider_id == 'cryptobot':
+        from bot.services.cryptobot import create_cryptobot_invoice
+
+        return await create_cryptobot_invoice(
+            order_id=intent.order_id,
+            amount=quote.charge_amount,
+            fiat=quote.charge_currency,
+            description=intent.description,
+        )
     if adapter.provider_id == 'yookassa_qr':
         raw = await create_yookassa_qr_payment(**common)
         return _link_result(raw, 'yookassa_payment_id')

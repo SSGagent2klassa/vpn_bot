@@ -25,10 +25,11 @@ from database.requests import (
 logger = logging.getLogger(__name__)
 
 RUB_PAYMENT_TYPES = {"cards", "yookassa_qr", "wata", "platega", "cardlink", "balance"}
-CENTS_PAYMENT_TYPES = {"crypto"} | RUB_PAYMENT_TYPES
+CENTS_PAYMENT_TYPES = {"crypto", "cryptobot"} | RUB_PAYMENT_TYPES
 
 PAYMENT_MINIMUMS = {
     "crypto": 1,
+    "cryptobot": 1,
     "stars": 1,
     "cards": 10000,
     "yookassa_qr": 100,
@@ -64,7 +65,7 @@ def _amount_unit(payment_type: str) -> str:
 
 
 def _base_amount(tariff: Dict[str, Any], payment_type: str) -> int:
-    if payment_type not in {"stars", "crypto"} | RUB_PAYMENT_TYPES and not _is_custom_payment_type(payment_type):
+    if payment_type not in {"stars", "crypto", "cryptobot"} | RUB_PAYMENT_TYPES and not _is_custom_payment_type(payment_type):
         raise ValueError(f"Неизвестный тип оплаты: {payment_type}")
     if tariff.get('price_minor') is not None:
         return max(0, int(tariff.get('price_minor') or 0))
@@ -135,7 +136,7 @@ def _payment_minimum(payment_type: str) -> int:
 
 
 def _payment_minimum_label(payment_type: str, minimum: int) -> str:
-    if _is_custom_payment_type(payment_type):
+    if payment_type == "cryptobot" or _is_custom_payment_type(payment_type):
         return format_amount(minimum, payment_type)
     return PAYMENT_MINIMUM_LABELS.get(payment_type, str(minimum))
 

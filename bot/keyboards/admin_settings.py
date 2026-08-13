@@ -4,47 +4,15 @@ from typing import List, Dict, Any, Optional
 
 from .admin_misc import back_button, home_button, cancel_button, state_pair_buttons
 
-def bot_settings_kb(current_mode: str = 'subscription') -> InlineKeyboardMarkup:
-    """
-    Keyboard of the 'Bot Settings' section.
-
-    Args:
-        current_mode: The bot's current operating mode ('subscription' | 'key').
-                      Only affects the label of the mode switch button.
-    """
+def bot_settings_kb() -> InlineKeyboardMarkup:
+    """Keyboard of the bot settings section."""
     builder = InlineKeyboardBuilder()
-    builder.row(*state_pair_buttons(
-        current_mode == 'subscription',
-        'Подписка',
-        'admin_select_bot_mode:subscription',
-        'Ключи',
-        'admin_select_bot_mode:key',
-        right_active_emoji='🟢',
-    ))
     builder.row(InlineKeyboardButton(text='🔄 Обновления', callback_data='admin_update_bot'))
     builder.row(InlineKeyboardButton(text='✏️ Изменить тексты', callback_data='admin_edit_texts'))
     builder.row(InlineKeyboardButton(text='📥 Скачать логи', callback_data='admin_logs_menu'))
     builder.row(InlineKeyboardButton(text='🛑 Остановить бота', callback_data='admin_stop_bot'))
     builder.row(back_button('admin_panel'), home_button())
     return builder.as_markup()
-
-
-def bot_mode_toggle_confirm_kb(target_mode: str) -> InlineKeyboardMarkup:
-    """
-    Confirmation keyboard for switching bot mode.
-
-    Args:
-        target_mode: Mode to switch to ('subscription' | 'key')
-    """
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text='✅ Да, переключить',
-                             callback_data=f'admin_set_bot_mode:{target_mode}'),
-        InlineKeyboardButton(text='❌ Отмена', callback_data='admin_bot_settings'),
-    )
-    return builder.as_markup()
-
-
 def extensions_diagnostics_kb(
     enabled: bool,
     setting_buttons: Optional[List[Dict[str, str]]] = None,
@@ -151,8 +119,13 @@ def referral_main_kb(enabled: bool, reward_type: str, levels: List[Dict[str, Any
         levels: List of levels [{level_number, percent, enabled}, ...]
     """
     builder = InlineKeyboardBuilder()
-    toggle_text = '🟢 Выключить' if enabled else '⚪ Включить'
-    builder.row(InlineKeyboardButton(text=toggle_text, callback_data='admin_referral_toggle'))
+    builder.row(*state_pair_buttons(
+        enabled,
+        'Включено',
+        'admin_referral_set:1',
+        'Выключено',
+        'admin_referral_set:0',
+    ))
     if reward_type == 'days':
         type_text = '📅 Режим: Дни к ключу'
     else:
@@ -178,8 +151,13 @@ def referral_level_kb(level_num: int, percent: int, enabled: bool) -> InlineKeyb
         enabled: Whether the level is enabled
     """
     builder = InlineKeyboardBuilder()
-    toggle_text = '🟢 Выключить' if enabled else '⚪ Включить'
-    builder.row(InlineKeyboardButton(text=toggle_text, callback_data=f'admin_referral_level_toggle:{level_num}'))
+    builder.row(*state_pair_buttons(
+        enabled,
+        'Включено',
+        f'admin_referral_level_set:{level_num}:1',
+        'Выключено',
+        f'admin_referral_level_set:{level_num}:0',
+    ))
     builder.row(InlineKeyboardButton(text=f'📊 Процент: {percent}%', callback_data=f'admin_referral_level_percent:{level_num}'))
     builder.row(back_button('admin_referral'), home_button())
     return builder.as_markup()

@@ -10,6 +10,20 @@ class ExtensionCoreAPI:
     def __init__(self, extension_id: str):
         self.extension_id = extension_id
 
+    def get_current_user(self) -> dict[str, Any] | None:
+        """Returns the safe user snapshot bound to the current extension call."""
+        from bot.utils.custom_extensions import _get_current_extension_telegram_id
+
+        telegram_id = _get_current_extension_telegram_id()
+        if telegram_id is None:
+            raise RuntimeError(
+                'get_current_user() requires an extension runtime with a current user'
+            )
+        telegram_id = _normalize_positive_int(telegram_id, 'telegram_id')
+        from bot.services.extension_user_snapshot import build_extension_user_snapshot
+
+        return build_extension_user_snapshot(telegram_id)
+
     def get_user_by_telegram_id(self, telegram_id: int) -> dict[str, Any] | None:
         """Returns a secure user profile without secrets and service fields."""
         telegram_id = _normalize_positive_int(telegram_id, 'telegram_id')

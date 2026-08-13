@@ -35,6 +35,7 @@ __all__ = [
     "set_user_active_promo_code",
     "clear_user_active_promo_code",
     "get_user_active_promo_code",
+    "get_user_active_promo_snapshot",
     "record_promo_link_visit",
     "save_order_pricing_snapshot",
     "reserve_promo_for_order",
@@ -553,6 +554,41 @@ def get_user_active_promo_code(user_id: int, order_id: Optional[str] = None) -> 
             conn.execute("UPDATE users SET active_promo_code_id = NULL WHERE id = ?", (user_id,))
             return None
         return promo
+
+
+def get_user_active_promo_snapshot(user_id: int) -> Optional[Dict[str, Any]]:
+    """Returns the current usable promo fields without mutating the user row."""
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                pc.id,
+                pc.type,
+                pc.code,
+                pc.discount_percent,
+                pc.expires_at,
+                pc.is_active,
+                pc.activation_limit
+            FROM users u
+            JOIN promo_codes pc ON pc.id = u.active_promo_code_id
+            WHERE u.id = ?
+            """,
+            (int(user_id),),
+        ).fetchone()
+        promo = _row_to_dict(row)
+        availability = _availability_for_row(
+            conn,
+            promo,
+            user_id=int(user_id),
+        )
+        if not availability['ok']:
+            return None
+    return {
+        'type': str(promo['type']),
+        'code': str(promo['code']),
+        'discount_percent': int(promo.get('discount_percent') or 0),
+        'expires_at': promo.get('expires_at'),
+    }
 
 
 def record_promo_link_visit(

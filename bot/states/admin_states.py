@@ -44,6 +44,7 @@ class AdminStates(StatesGroup):
     crypto_setup_url = State()       # Entering a link to a product
     crypto_setup_secret = State()    # Entering the secret key
     edit_crypto = State()            # Editing crypto settings
+    cryptobot_setup_token = State()  # Entering the Crypto Pay API token
 
     # ========== Setting up QR payment YuKassa ==========
     qr_setup_shop_id = State()       # Entering Shop ID
@@ -122,7 +123,6 @@ class AdminStates(StatesGroup):
     # ========== Adding a key by administrator ==========
     add_key_group = State()          # Tariff group selection
     add_key_server = State()         # Server selection
-    add_key_inbound = State()        # Selecting inbound (protocol)
     add_key_traffic = State()        # Entering traffic limit (GB)
     add_key_days = State()           # Enter validity period (days)
     add_key_devices = State()        # Enter device limit

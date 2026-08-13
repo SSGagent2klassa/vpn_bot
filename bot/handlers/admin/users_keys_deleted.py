@@ -105,7 +105,7 @@ async def on_key_delete_confirm(callback: CallbackQuery):
 
 
 async def _delete_key_from_panel(key: dict) -> bool:
-    """Removes a key from the panel, taking into account subscription keys in all inbound."""
+    """Remove one logical client from its panel by managed email."""
     key_id = key.get('id')
     if not (key.get('server_active') and key.get('host')):
         return False
@@ -117,32 +117,22 @@ async def _delete_key_from_panel(key: dict) -> bool:
         )
         return False
 
-    is_subscription_key = bool(key.get('sub_id') and key.get('panel_email'))
-    is_single_key = bool(key.get('panel_inbound_id') and key.get('client_uuid'))
-    if not (is_subscription_key or is_single_key):
+    if not (key.get('sub_id') and key.get('panel_email')):
         return False
 
     try:
         server_data = _build_server_data(key)
         client = get_client_from_server_data(server_data)
 
-        if is_subscription_key:
-            deleted_count = await client.delete_clients_by_email_on_server(key['panel_email'])
-            if deleted_count > 0:
-                logger.info(
-                    f"Ключ #{key_id} удалён с панели {key.get('server_name')} "
-                    f"по panel_email={key.get('panel_email')} ({deleted_count} inbound/client)"
-                )
-                return True
-            logger.warning(
-                f"Ключ #{key_id} не найден на панели {key.get('server_name')} "
-                f"по panel_email={key.get('panel_email')}"
+        deleted = await client.delete_client(key['panel_email'])
+        if deleted:
+            logger.info(
+                "Ключ #%s удалён с панели %s по panel_email=%s",
+                key_id,
+                key.get('server_name'),
+                key.get('panel_email'),
             )
-            return False
-
-        await client.delete_client(key['panel_inbound_id'], key['client_uuid'])
-        logger.info(f"Ключ #{key_id} удалён с панели {key.get('server_name')}")
-        return True
+        return bool(deleted)
     except Exception as e:
         logger.warning(f"Не удалось удалить ключ #{key_id} с панели: {e}")
         return False
@@ -207,7 +197,7 @@ async def on_sync_deleted_panel_confirm(callback: CallbackQuery):
     for server in servers:
         try:
             client = get_client_from_server_data(server)
-            snapshot = await client.get_sync_snapshot(subscription_mode=True)
+            snapshot = await client.get_sync_snapshot()
             orphan_emails = sorted(
                 {
                     state.email
@@ -440,7 +430,7 @@ async def on_sync_db_missing_ask(callback: CallbackQuery):
 
     try:
         client = get_client_from_server_data(server)
-        snapshot = await client.get_sync_snapshot(subscription_mode=True)
+        snapshot = await client.get_sync_snapshot()
         panel_emails = set(snapshot.clients)
 
         from database.connection import get_db
@@ -501,7 +491,7 @@ async def on_sync_db_missing_confirm(callback: CallbackQuery):
 
     try:
         client = get_client_from_server_data(server)
-        snapshot = await client.get_sync_snapshot(subscription_mode=True)
+        snapshot = await client.get_sync_snapshot()
         panel_emails = set(snapshot.clients)
 
         from database.connection import get_db
@@ -656,7 +646,7 @@ async def _scan_db_keys() -> dict:
 
         try:
             client = get_client_from_server_data(server)
-            snapshot = await client.get_sync_snapshot(subscription_mode=True)
+            snapshot = await client.get_sync_snapshot()
             panel_emails = set(snapshot.clients)
 
             missing = 0

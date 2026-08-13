@@ -13,12 +13,20 @@ from bot.services.user_locks import user_locks
 logger = logging.getLogger(__name__)
 
 
+def _has_complete_binding(key: Mapping[str, Any]) -> bool:
+    """Return whether a database row has the complete subscription identity."""
+    return bool(
+        key.get("server_id")
+        and str(key.get("panel_email") or "").strip()
+        and str(key.get("sub_id") or "").strip()
+    )
+
+
 class NewKeySetupStatus(str, Enum):
     """Stable outcomes consumed by interactive and background adapters."""
 
     READY = "ready"
     AWAITING_SERVER = "awaiting_server"
-    AWAITING_INBOUND = "awaiting_inbound"
     PROVISIONING = "provisioning"
     UNAVAILABLE = "unavailable"
     RETRYABLE_FAILURE = "retryable_failure"
@@ -36,10 +44,7 @@ class NewKeySetupResult:
     username: str | None = None
     server_id: int | None = None
     server_name: str | None = None
-    inbound_id: int | None = None
-    subscription_mode: bool = False
     servers: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
-    inbounds: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
     key_data: Mapping[str, Any] | None = None
     page_key: str | None = None
     error_code: str | None = None
@@ -169,7 +174,6 @@ async def resolve_new_key_setup(
     *,
     expected_telegram_id: int | None = None,
     server_id: int | None = None,
-    inbound_id: int | None = None,
 ) -> NewKeySetupResult:
     """Resolve the next deterministic step without mutating the key or panel."""
     context = _load_setup_context(
@@ -179,17 +183,11 @@ async def resolve_new_key_setup(
     if isinstance(context, NewKeySetupResult):
         return context
 
-    if context.key.get("server_id"):
+    if _has_complete_binding(context.key):
         return _result_from_context(
             context,
             NewKeySetupStatus.READY,
             server_id=int(context.key["server_id"]),
-            inbound_id=(
-                int(context.key["panel_inbound_id"])
-                if context.key.get("panel_inbound_id") is not None
-                else None
-            ),
-            subscription_mode=bool(context.key.get("sub_id")),
             key_data=dict(context.key),
             already_configured=True,
         )
@@ -231,91 +229,11 @@ async def resolve_new_key_setup(
             )
 
     normalized_server_id = int(selected_server["id"])
-    from bot.services.vpn_api import (
-        get_client,
-        get_client_inbound_descriptors,
-        is_subscription_mode,
-    )
-
-    if is_subscription_mode():
-        return _result_from_context(
-            context,
-            NewKeySetupStatus.PROVISIONING,
-            server_id=normalized_server_id,
-            server_name=str(selected_server.get("name") or "") or None,
-            subscription_mode=True,
-        )
-
-    try:
-        client = await get_client(normalized_server_id)
-        descriptors = await get_client_inbound_descriptors(
-            client,
-            subscription_mode=False,
-        )
-        inbounds = tuple(descriptor.as_inbound() for descriptor in descriptors)
-    except Exception as error:
-        logger.warning(
-            "Failed to inspect inbounds for new key order=%s server=%s: %s",
-            context.order["order_id"],
-            normalized_server_id,
-            error,
-        )
-        return _failure(
-            str(context.order["order_id"]),
-            status=NewKeySetupStatus.RETRYABLE_FAILURE,
-            page_key="key_operation_failed",
-            error_code="panel_unavailable",
-            error=str(error),
-            context=context,
-        )
-
-    if not inbounds:
-        return _failure(
-            str(context.order["order_id"]),
-            status=NewKeySetupStatus.UNAVAILABLE,
-            page_key="key_operation_unavailable",
-            error_code="no_inbounds",
-            context=context,
-        )
-
-    selected_inbound: Mapping[str, Any] | None = None
-    if inbound_id is None:
-        if len(inbounds) > 1:
-            return _result_from_context(
-                context,
-                NewKeySetupStatus.AWAITING_INBOUND,
-                server_id=normalized_server_id,
-                server_name=str(selected_server.get("name") or "") or None,
-                inbounds=inbounds,
-                page_key="new_key_inbound_select",
-            )
-        selected_inbound = inbounds[0]
-    else:
-        selected_inbound = next(
-            (
-                inbound
-                for inbound in inbounds
-                if int(inbound.get("id") or 0) == int(inbound_id)
-            ),
-            None,
-        )
-        if selected_inbound is None:
-            return _failure(
-                str(context.order["order_id"]),
-                status=NewKeySetupStatus.UNAVAILABLE,
-                page_key="key_operation_unavailable",
-                error_code="inbound_unavailable",
-                context=context,
-            )
-
     return _result_from_context(
         context,
         NewKeySetupStatus.PROVISIONING,
         server_id=normalized_server_id,
         server_name=str(selected_server.get("name") or "") or None,
-        inbound_id=int(selected_inbound["id"]),
-        inbounds=inbounds,
-        subscription_mode=False,
     )
 
 
@@ -340,7 +258,6 @@ async def provision_new_key(
             setup.order_id,
             expected_telegram_id=expected_telegram_id,
             server_id=setup.server_id,
-            inbound_id=setup.inbound_id,
         )
         if current.status is not NewKeySetupStatus.PROVISIONING:
             return current
@@ -366,7 +283,11 @@ async def provision_new_key(
 async def _provision_resolved_new_key(
     setup: NewKeySetupResult,
 ) -> NewKeySetupResult:
-    from bot.services.vpn_api import get_key_expiry_time_ms, provision_client_on_server
+    from bot.services.vpn_api import (
+        get_client,
+        get_key_expiry_time_ms,
+        provision_client_on_server,
+    )
     from bot.utils.billing_values import resolve_duration_days
     from bot.utils.panel_email import generate_unique_panel_email
     from database.requests import (
@@ -375,7 +296,7 @@ async def _provision_resolved_new_key(
         get_tariff_by_id,
         get_user_by_id,
         update_payment_key_id,
-        update_vpn_key_config,
+        update_vpn_key_binding,
     )
 
     order = find_order_by_order_id(setup.order_id)
@@ -384,7 +305,7 @@ async def _provision_resolved_new_key(
     key = get_key_details_for_user(setup.key_id, setup.telegram_id)
     if not key:
         raise RuntimeError("New-key draft disappeared")
-    if key.get("server_id"):
+    if _has_complete_binding(key):
         return replace(
             setup,
             status=NewKeySetupStatus.READY,
@@ -418,43 +339,80 @@ async def _provision_resolved_new_key(
         0,
         int(key.get("tariff_max_ips") or tariff.get("max_ips") or 1),
     )
-    event_context: dict[str, Any]
+    requested_sub_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"yadrenovpn-subscription:{stable_identity}",
+    ).hex
+    provisioned = await provision_client_on_server(
+        server_id=setup.server_id,
+        email=panel_email,
+        total_gb=limit_gb,
+        total_gb_bytes=persisted_limit_bytes,
+        expire_days=days,
+        expiry_time_ms=exact_expiry_time_ms,
+        limit_ip=max_ips,
+        enable=True,
+        tg_id=str(setup.telegram_id),
+        sub_id=requested_sub_id,
+    )
+    ready_count = len(provisioned.attached_inbound_ids)
+    effective_sub_id = str(provisioned.sub_id or "").strip()
+    if ready_count == 0 or not effective_sub_id:
+        try:
+            await (await get_client(setup.server_id)).delete_client(panel_email)
+        except Exception:
+            logger.exception(
+                "Failed to clean unusable subscription candidate order=%s email=%s",
+                setup.order_id,
+                panel_email,
+            )
+        raise RuntimeError("Panel did not provision any subscription inbound")
+    if not update_vpn_key_binding(
+        key_id=setup.key_id,
+        server_id=setup.server_id,
+        panel_email=panel_email,
+        sub_id=effective_sub_id,
+    ):
+        try:
+            await (await get_client(setup.server_id)).delete_client(panel_email)
+        except Exception:
+            logger.exception(
+                "Failed to clean unbound subscription candidate order=%s email=%s",
+                setup.order_id,
+                panel_email,
+            )
+        raise RuntimeError("Failed to persist subscription key configuration")
 
-    if setup.subscription_mode:
-        requested_sub_id = uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            f"yadrenovpn-subscription:{stable_identity}",
-        ).hex
-        provisioned = await provision_client_on_server(
-            server_id=setup.server_id,
-            email=panel_email,
-            total_gb=limit_gb,
-            total_gb_bytes=persisted_limit_bytes,
-            expire_days=days,
-            expiry_time_ms=exact_expiry_time_ms,
-            limit_ip=max_ips,
-            enable=True,
-            tg_id=str(setup.telegram_id),
-            sub_id=requested_sub_id,
-            subscription_mode=True,
+    if provisioned.complete:
+        sync_stats = {
+            "created": ready_count,
+            "deleted": 0,
+            "enabled": 0,
+            "disabled": 0,
+            "updated": 0,
+            "skipped": ready_count,
+            "reset": 0,
+            "errors": 0,
+            "ok": 1,
+        }
+    else:
+        from bot.services.vpn_api import sync_key_to_panel_state
+
+        sync_kwargs = (
+            {"panel_snapshot": provisioned.snapshot}
+            if provisioned.snapshot is not None
+            else {}
         )
-        primary_inbound_id = provisioned.primary_inbound_id
-        credential = provisioned.credential
-        ready_count = len(provisioned.attached_inbound_ids)
-        if ready_count == 0 or primary_inbound_id is None or not credential:
-            raise RuntimeError("Panel did not provision any subscription inbound")
-        effective_sub_id = provisioned.sub_id or requested_sub_id
-        if not update_vpn_key_config(
-            key_id=setup.key_id,
-            server_id=setup.server_id,
-            panel_inbound_id=primary_inbound_id,
-            panel_email=panel_email,
-            client_uuid=credential,
-            sub_id=effective_sub_id,
-        ):
-            raise RuntimeError("Failed to persist subscription key configuration")
-
-        if provisioned.complete:
+        try:
+            sync_stats = await sync_key_to_panel_state(setup.key_id, **sync_kwargs)
+        except Exception as error:
+            logger.warning(
+                "Initial subscription reconciliation failed order=%s key=%s: %s",
+                setup.order_id,
+                setup.key_id,
+                error,
+                exc_info=True,
+            )
             sync_stats = {
                 "created": ready_count,
                 "deleted": 0,
@@ -463,81 +421,14 @@ async def _provision_resolved_new_key(
                 "updated": 0,
                 "skipped": ready_count,
                 "reset": 0,
-                "errors": 0,
-                "ok": 1,
+                "errors": 1,
+                "ok": 0,
             }
-        else:
-            from bot.services.vpn_api import sync_key_to_panel_state
-
-            sync_kwargs = (
-                {"panel_snapshot": provisioned.snapshot}
-                if provisioned.snapshot is not None
-                else {}
-            )
-            try:
-                sync_stats = await sync_key_to_panel_state(setup.key_id, **sync_kwargs)
-            except Exception as error:
-                # The key has already been persisted after a successful panel
-                # mutation. A reconciliation failure must not turn that success
-                # into a second provisioning attempt or suppress the lifecycle
-                # event; the regular synchronizer can repair secondary inbounds.
-                logger.warning(
-                    "Initial subscription reconciliation failed order=%s key=%s: %s",
-                    setup.order_id,
-                    setup.key_id,
-                    error,
-                    exc_info=True,
-                )
-                sync_stats = {
-                    "created": ready_count,
-                    "deleted": 0,
-                    "enabled": 0,
-                    "disabled": 0,
-                    "updated": 0,
-                    "skipped": ready_count,
-                    "reset": 0,
-                    "errors": 1,
-                    "ok": 0,
-                }
-        event_context = {
-            "panel_inbound_id": primary_inbound_id,
-            "panel_email": panel_email,
-            "sub_id": effective_sub_id,
-            "subscription_mode": True,
-            "sync_stats": sync_stats,
-        }
-    else:
-        if setup.inbound_id is None:
-            raise RuntimeError("Key-mode provisioning requires an inbound")
-        provisioned = await provision_client_on_server(
-            server_id=setup.server_id,
-            email=panel_email,
-            total_gb=limit_gb,
-            total_gb_bytes=persisted_limit_bytes,
-            expire_days=days,
-            expiry_time_ms=exact_expiry_time_ms,
-            limit_ip=max_ips,
-            enable=True,
-            tg_id=str(setup.telegram_id),
-            subscription_mode=False,
-            inbound_ids=[setup.inbound_id],
-        )
-        if provisioned.primary_inbound_id is None or not provisioned.credential:
-            raise RuntimeError("Panel did not provision the selected inbound")
-        if not update_vpn_key_config(
-            key_id=setup.key_id,
-            server_id=setup.server_id,
-            panel_inbound_id=setup.inbound_id,
-            panel_email=panel_email,
-            client_uuid=provisioned.credential,
-        ):
-            raise RuntimeError("Failed to persist key configuration")
-        event_context = {
-            "panel_inbound_id": setup.inbound_id,
-            "panel_email": panel_email,
-            "client_uuid": provisioned.credential,
-            "subscription_mode": False,
-        }
+    event_context = {
+        "panel_email": panel_email,
+        "sub_id": effective_sub_id,
+        "sync_stats": sync_stats,
+    }
 
     update_payment_key_id(setup.order_id, setup.key_id)
     from bot.services.key_lifecycle import emit_key_lifecycle_event_safe
@@ -561,11 +452,6 @@ async def _provision_resolved_new_key(
     return replace(
         setup,
         status=NewKeySetupStatus.READY,
-        inbound_id=(
-            int(ready_key["panel_inbound_id"])
-            if ready_key.get("panel_inbound_id") is not None
-            else setup.inbound_id
-        ),
         key_data=dict(ready_key),
         already_configured=False,
         page_key=None,

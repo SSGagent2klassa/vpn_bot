@@ -27,19 +27,27 @@ def yadreno_admin_no_key_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def yadreno_admin_chat_kb(topic_id: int = 0) -> InlineKeyboardMarkup:
+def yadreno_admin_chat_kb(
+    topic_id: int = 0,
+    *,
+    show_api_key_action: bool = True,
+) -> InlineKeyboardMarkup:
     """Agent chat input keyboard."""
     builder = InlineKeyboardBuilder()
-    builder.row(
+    primary_buttons = [
         InlineKeyboardButton(
             text='🆕 Новый чат',
             callback_data=f'admin_yadreno_new_chat:{int(topic_id)}',
-        ),
-        InlineKeyboardButton(
-            text='🔑 Заменить api_key',
-            callback_data='admin_yadreno_set_key',
-        ),
-    )
+        )
+    ]
+    if show_api_key_action:
+        primary_buttons.append(
+            InlineKeyboardButton(
+                text='🔑 Заменить api_key',
+                callback_data='admin_yadreno_set_key',
+            )
+        )
+    builder.row(*primary_buttons)
     builder.row(back_button('admin_panel'), home_button())
     return builder.as_markup()
 
@@ -85,11 +93,18 @@ def yadreno_admin_request_error_kb(
     topic_id: int = 0,
     *,
     active_request: bool,
+    configuration_error: bool = False,
+    show_api_key_action: bool = True,
 ) -> InlineKeyboardMarkup:
     """Show task controls only when the rejected turn has an active request."""
+    if configuration_error:
+        return yadreno_admin_chat_kb(topic_id)
     if active_request:
         return yadreno_admin_agent_kb(topic_id)
-    return yadreno_admin_chat_kb(topic_id)
+    return yadreno_admin_chat_kb(
+        topic_id,
+        show_api_key_action=show_api_key_action,
+    )
 
 
 def yadreno_admin_cancel_key_kb() -> InlineKeyboardMarkup:

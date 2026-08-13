@@ -38,40 +38,5 @@ def check_unblock_conditions():
     return get_setting('referral_enabled', '0') == '1'
 """
 
-from bot.utils.panel_version import (
-    MINIMUM_SUPPORTED_3X_UI_VERSION,
-    panel_version_at_least,
-)
-
-
-BLOCKING_MESSAGE = (
-    "🔒 <b>Перед следующим обновлением обновите панели 3X-UI</b>\n\n"
-    "Следующие версии бота поддерживают только официальную <b>3X-UI 3.3.0 "
-    "или новее</b>. Обновления приостановлены, пока совместимая версия не "
-    "будет подтверждена для каждого добавленного сервера.\n\n"
-    "<b>Что необходимо сделать:</b>\n"
-    "1. Обновите все добавленные панели до <b>3X-UI 3.3.0+</b>.\n"
-    "2. Откройте в боте раздел <b>Серверы</b> и дождитесь успешной проверки "
-    "подключения, чтобы бот сохранил актуальную версию каждой панели.\n"
-    "3. Снова откройте раздел <b>Обновления</b>. Блокировка снимется "
-    "автоматически.\n\n"
-    "Сервер с версией ниже 3.3.0 или с неопределённой версией продолжит "
-    "блокировать обновление. Если сервер больше не используется, удалите его "
-    "из бота.\n\n"
-    "Текущая версия бота продолжит работать без изменений. Аварийные способы "
-    "обновления предназначены только для восстановления, а не для обхода "
-    "этого требования."
-)
-
-
-def check_unblock_conditions() -> bool:
-    """Unlock later releases only when every saved panel is 3X-UI 3.3.0+."""
-    from database.requests import get_all_servers
-
-    return all(
-        panel_version_at_least(
-            server.get("panel_version"),
-            MINIMUM_SUPPORTED_3X_UI_VERSION,
-        )
-        for server in get_all_servers()
-    )
+# No active blocking condition in the current release.
+BLOCKING_MESSAGE = None

@@ -37,6 +37,8 @@ DATABASE_BACKUP_FILENAME = "vpn_bot.db"
 MIGRATION_CANDIDATE_FILENAME = "migration_candidate.db"
 FAILED_MIGRATION_CANDIDATE_FILENAME = "migration_failed.db"
 ROLLBACK_RUNNER_FILENAME = "rollback_runner.py"
+SERVICE_RUNNER_FILENAME = "service_runner.py"
+SERVICE_REQUEST_FILENAME = "service_request.json"
 ROLLBACK_RESULT_FILENAME = "rollback_result.json"
 UPDATE_RESULT_FILENAME = "update_result.json"
 UPDATE_HEALTH_FILENAME = "update_health.json"
@@ -44,12 +46,22 @@ OPERATION_LOCK_FILENAME = ".operation.lock"
 MAX_ROLLBACK_POINTS = 3
 ROLLBACK_RETENTION_DAYS = 7
 SERVICE_NAME = "yadreno-vpn"
+UPDATER_SERVICE_TEMPLATE = "yadreno-vpn-updater@"
+SERVICE_REQUEST_FORMAT_VERSION = 1
 UNKNOWN_RELEASE = "unknown"
 UPDATE_STARTUP_TIMEOUT_SECONDS = 120
 UPDATE_STABLE_SECONDS = 10
 UPDATE_ACTIVATION_TIMEOUT_SECONDS = 60
 DATABASE_CHECK_ERROR_LIMIT = 5
-ORDERED_UPDATE_MODES = frozenset({"admin_regular", "installer_update"})
+ORDERED_UPDATE_MODES = frozenset(
+    {
+        "admin_regular",
+        "admin_blocking",
+        "admin_force",
+        "admin_force_blocking",
+        "installer_update",
+    }
+)
 
 ELIGIBLE_ROLLBACK_STATUSES = {"applied", "applied_with_errors"}
 _RELEASE_PREFIX_RE = re.compile(
@@ -390,7 +402,7 @@ def _plain_telegram_html(value: str) -> str:
     return html.unescape(without_tags).strip()
 
 
-def _ensure_ordered_update_unblocked() -> None:
+def ensure_ordered_update_unblocked() -> None:
     """Fail closed while the installed blocking-update condition is unmet."""
     try:
         from bot.utils.update_block import (
@@ -419,11 +431,11 @@ def _resolve_ordered_update_stage(
     target_commit: str,
     block_updates: bool,
 ) -> tuple[str, bool]:
-    """Apply the marked-release gate to normal, non-emergency update modes."""
+    """Apply the marked-release gate to ordered, non-emergency update modes."""
     if update_mode not in ORDERED_UPDATE_MODES:
         return target_commit, block_updates
 
-    _ensure_ordered_update_unblocked()
+    ensure_ordered_update_unblocked()
     blocking_commit = _first_blocking_commit_between(
         project_root,
         source_commit=source_commit,
@@ -556,9 +568,21 @@ def _backup_database(source_path: Path, destination_path: Path) -> None:
         raise
 
 
+def _new_sibling_temp_path(path: Path) -> Path:
+    """Create a unique temporary file beside an atomic-write target."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    os.close(descriptor)
+    return Path(raw_path)
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp_path = _new_sibling_temp_path(path)
     try:
         with temp_path.open("w", encoding="utf-8", newline="\n") as output:
             json.dump(payload, output, ensure_ascii=False, indent=2, sort_keys=True)
@@ -590,6 +614,243 @@ def _fsync_directory(path: Path) -> None:
         pass
     finally:
         os.close(descriptor)
+
+
+def _registered_updater_unit(snapshot_id: str) -> str:
+    """Return the installed systemd template instance for one snapshot."""
+    if not _SNAPSHOT_ID_RE.fullmatch(snapshot_id or ""):
+        raise UpdateRollbackError("Invalid updater snapshot identifier")
+    return f"{UPDATER_SERVICE_TEMPLATE}{snapshot_id}.service"
+
+
+def _systemd_quote(value: str) -> str:
+    """Quote one literal systemd unit argument."""
+    if not value or any(character in value for character in ("\x00", "\n", "\r")):
+        raise UpdateRollbackError("Invalid value for updater systemd unit")
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("%", "%%")
+    )
+    return f'"{escaped}"'
+
+
+def install_registered_updater_service(
+    *,
+    project_root: str | Path | None = None,
+    service_name: str = SERVICE_NAME,
+    systemd_directory: str | Path = "/etc/systemd/system",
+    python_executable: str | Path | None = None,
+) -> Path:
+    """Install or refresh the stable updater template and reload systemd."""
+    root = _resolve_project_root(project_root)
+    # Keep the venv launcher path: resolving its symlink would switch the
+    # worker to the system interpreter and install requirements outside venv.
+    python_path = Path(python_executable or sys.executable).absolute()
+    if not python_path.is_file():
+        raise UpdateRollbackError(f"Updater Python executable is missing: {python_path}")
+
+    unit_directory = Path(systemd_directory).resolve()
+    unit_directory.mkdir(parents=True, exist_ok=True)
+    unit_path = unit_directory / f"{UPDATER_SERVICE_TEMPLATE}.service"
+    runner_placeholder = "__YADRENO_SYSTEMD_INSTANCE__"
+    runner_path = (
+        root
+        / "backup"
+        / PRE_UPDATE_DIRNAME
+        / runner_placeholder
+        / SERVICE_RUNNER_FILENAME
+    )
+    quoted_runner = _systemd_quote(str(runner_path)).replace(
+        runner_placeholder,
+        "%i",
+    )
+    content = (
+        "[Unit]\n"
+        "Description=Yadreno VPN managed updater for snapshot %i\n"
+        "Wants=network-online.target\n"
+        "After=network-online.target\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "User=root\n"
+        f"WorkingDirectory={_systemd_quote(str(root))}\n"
+        f"ExecStart={_systemd_quote(str(python_path))} {quoted_runner} "
+        f"service-request --project-root {_systemd_quote(str(root))} "
+        f"--snapshot-id %i --service-name {_systemd_quote(service_name)}\n"
+        "TimeoutStartSec=20min\n"
+        "UMask=0077\n"
+        "Environment=PYTHONUNBUFFERED=1\n"
+    )
+
+    current_content: str | None = None
+    try:
+        current_content = unit_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise UpdateRollbackError(f"Cannot read updater systemd unit: {exc}") from exc
+
+    if current_content != content:
+        temporary_path = _new_sibling_temp_path(unit_path)
+        try:
+            with temporary_path.open("w", encoding="utf-8", newline="\n") as target:
+                target.write(content)
+                target.flush()
+                os.fsync(target.fileno())
+            temporary_path.chmod(0o644)
+            os.replace(temporary_path, unit_path)
+            _fsync_directory(unit_directory)
+        except OSError as exc:
+            raise UpdateRollbackError(
+                f"Cannot install updater systemd unit: {exc}"
+            ) from exc
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    result = _run_command(
+        ["systemctl", "daemon-reload"],
+        cwd=root,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        output = (result.stdout + result.stderr).strip()
+        raise UpdateRollbackError(output or "systemctl daemon-reload failed")
+    return unit_path
+
+
+def _stage_registered_service_request(
+    project_root: Path,
+    snapshot_id: str,
+    *,
+    operation: str,
+    admin_id: int,
+    **operation_data: Any,
+) -> str:
+    """Store one request for the installed updater service template."""
+    snapshot_dir = _safe_snapshot_dir(project_root, snapshot_id)
+    if not snapshot_dir.is_dir():
+        raise UpdateRollbackError("Updater snapshot directory is missing")
+
+    runner_path = snapshot_dir / SERVICE_RUNNER_FILENAME
+    temp_runner = _new_sibling_temp_path(runner_path)
+    try:
+        shutil.copy2(Path(__file__).resolve(), temp_runner)
+        try:
+            temp_runner.chmod(0o700)
+        except OSError:
+            pass
+        os.replace(temp_runner, runner_path)
+        _fsync_directory(snapshot_dir)
+    finally:
+        temp_runner.unlink(missing_ok=True)
+
+    request = dict(operation_data)
+    request.update(
+        {
+            "format_version": SERVICE_REQUEST_FORMAT_VERSION,
+            "snapshot_id": snapshot_id,
+            "operation": operation,
+            "status": "pending",
+            "admin_id": int(admin_id),
+            "created_at": _isoformat_utc(_utc_now()),
+        }
+    )
+    _atomic_write_json(snapshot_dir / SERVICE_REQUEST_FILENAME, request)
+    return _registered_updater_unit(snapshot_id)
+
+
+def _discard_registered_service_request(
+    project_root: Path,
+    snapshot_id: str,
+) -> None:
+    """Remove a request whose systemd start job was not accepted."""
+    snapshot_dir = _safe_snapshot_dir(project_root, snapshot_id)
+    (snapshot_dir / SERVICE_REQUEST_FILENAME).unlink(missing_ok=True)
+    (snapshot_dir / SERVICE_RUNNER_FILENAME).unlink(missing_ok=True)
+
+
+def _run_registered_service_request(
+    snapshot_id: str,
+    *,
+    project_root: str | Path | None = None,
+    service_name: str = SERVICE_NAME,
+) -> UpdateExecutionResult | RollbackExecutionResult:
+    """Consume one request started by the installed systemd template."""
+    root = _resolve_project_root(project_root)
+    request_path = _safe_snapshot_dir(root, snapshot_id) / SERVICE_REQUEST_FILENAME
+    request = _load_json(request_path)
+    if request.get("format_version") != SERVICE_REQUEST_FORMAT_VERSION:
+        raise UpdateRollbackError("Unsupported updater service request format")
+    if request.get("snapshot_id") != snapshot_id:
+        raise UpdateRollbackError("Updater service request snapshot mismatch")
+    if request.get("status") != "pending":
+        raise UpdateRollbackError("Updater service request is not pending")
+
+    operation = request.get("operation")
+    if operation not in {"update", "rollback"}:
+        raise UpdateRollbackError("Unsupported updater service operation")
+    try:
+        admin_id = int(request["admin_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise UpdateRollbackError(
+            "Updater service request administrator is invalid"
+        ) from exc
+    start_delay = request.get("start_delay", 0)
+    if not isinstance(start_delay, (int, float)) or isinstance(start_delay, bool):
+        raise UpdateRollbackError("Updater service request delay is invalid")
+
+    request["status"] = "running"
+    request["started_at"] = _isoformat_utc(_utc_now())
+    _atomic_write_json(request_path, request)
+    if start_delay > 0:
+        time.sleep(min(float(start_delay), 10.0))
+
+    try:
+        if operation == "rollback":
+            result: UpdateExecutionResult | RollbackExecutionResult = perform_rollback(
+                snapshot_id,
+                project_root=root,
+                service_name=service_name,
+                admin_id=admin_id,
+                manage_service=True,
+            )
+        else:
+            target = request.get("target")
+            strategy = request.get("strategy")
+            clean_untracked = request.get("clean_untracked", False)
+            block_updates = request.get("block_updates", False)
+            if not isinstance(target, str) or not target:
+                raise UpdateRollbackError("Updater service target is invalid")
+            if strategy not in {"pull", "reset"}:
+                raise UpdateRollbackError("Updater service strategy is invalid")
+            if not isinstance(clean_untracked, bool) or not isinstance(block_updates, bool):
+                raise UpdateRollbackError("Updater service flags are invalid")
+            result = perform_update_transaction(
+                snapshot_id,
+                target=target,
+                strategy=strategy,
+                project_root=root,
+                service_name=service_name,
+                admin_id=admin_id,
+                clean_untracked=clean_untracked,
+                block_updates=block_updates,
+                manage_service=True,
+            )
+    except Exception as exc:
+        request["status"] = "failed"
+        request["finished_at"] = _isoformat_utc(_utc_now())
+        request["error"] = _bounded_detail(exc)
+        try:
+            _atomic_write_json(request_path, request)
+        except Exception:
+            logger.exception("Cannot persist failed updater service request")
+        raise
+
+    request["status"] = "success" if result.success else "failed"
+    request["finished_at"] = _isoformat_utc(_utc_now())
+    request["result"] = _bounded_detail(result.message)
+    _atomic_write_json(request_path, request)
+    return result
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -1462,13 +1723,64 @@ def _create_migration_candidate(
 ) -> Path:
     candidate = snapshot.snapshot_dir / MIGRATION_CANDIDATE_FILENAME
     failed_candidate = snapshot.snapshot_dir / FAILED_MIGRATION_CANDIDATE_FILENAME
-    candidate.unlink(missing_ok=True)
-    failed_candidate.unlink(missing_ok=True)
+    for database_path in (candidate, failed_candidate):
+        database_path.unlink(missing_ok=True)
+        for suffix in ("-wal", "-shm"):
+            Path(str(database_path) + suffix).unlink(missing_ok=True)
     _backup_database(
         snapshot.snapshot_dir / DATABASE_BACKUP_FILENAME,
         candidate,
     )
     return candidate
+
+
+def _set_candidate_update_block(candidate: Path) -> None:
+    """Persist the marked-release block without leaving a live connection."""
+    connection = sqlite3.connect(str(candidate), timeout=30)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        foreign_keys_row = connection.execute("PRAGMA foreign_keys").fetchone()
+        if not foreign_keys_row or foreign_keys_row[0] != 1:
+            raise UpdateRollbackError(
+                "Не удалось включить foreign_keys для blocking update"
+            )
+        connection.execute(
+            "INSERT INTO settings (key, value) VALUES ('update_blocked', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _require_single_file_candidate(candidate: Path, *, stage: str) -> None:
+    """Reject WAL state that would make atomic main-file promotion unsafe."""
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(candidate) + suffix)
+        if not sidecar.exists():
+            continue
+        size = sidecar.stat().st_size
+        if size > 0:
+            raise UpdateRollbackError(
+                f"{stage}: candidate sidecar remains non-empty: "
+                f"{sidecar.name}={size} bytes"
+            )
+        sidecar.unlink(missing_ok=True)
+
+
+def _retain_failed_migration_candidate(candidate: Path, failed_candidate: Path) -> None:
+    """Best-effort retention of the candidate and any diagnostic WAL sidecars."""
+    for suffix in ("", "-wal", "-shm"):
+        source = Path(str(candidate) + suffix)
+        destination = Path(str(failed_candidate) + suffix)
+        try:
+            if source.exists():
+                os.replace(source, destination)
+        except OSError:
+            pass
 
 
 def _run_candidate_migrations(
@@ -1494,16 +1806,11 @@ def _run_candidate_migrations(
             stage="Running database migrations on candidate",
         )
         if block_updates:
-            with sqlite3.connect(str(candidate), timeout=30) as connection:
-                connection.execute("PRAGMA foreign_keys = ON")
-                if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
-                    raise UpdateRollbackError(
-                        "Не удалось включить foreign_keys для blocking update"
-                    )
-                connection.execute(
-                    "INSERT INTO settings (key, value) VALUES ('update_blocked', '1') "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-                )
+            _set_candidate_update_block(candidate)
+        _require_single_file_candidate(
+            candidate,
+            stage="Post-migration WAL finalization",
+        )
         _check_database_integrity(candidate)
         _record_snapshot_check(
             snapshot.snapshot_dir,
@@ -1524,11 +1831,7 @@ def _run_candidate_migrations(
             error=str(exc),
         )
         failed_candidate = snapshot.snapshot_dir / FAILED_MIGRATION_CANDIDATE_FILENAME
-        try:
-            if candidate.exists():
-                os.replace(candidate, failed_candidate)
-        except OSError:
-            pass
+        _retain_failed_migration_candidate(candidate, failed_candidate)
         raise
 
 
@@ -1537,6 +1840,10 @@ def _promote_database_candidate(
     destination: Path,
 ) -> None:
     """Atomically promote a fully validated candidate to the live database."""
+    _require_single_file_candidate(
+        candidate,
+        stage="Database candidate promotion",
+    )
     _check_database_integrity(candidate)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if candidate.stat().st_dev != destination.parent.stat().st_dev:
@@ -2329,13 +2636,21 @@ def schedule_admin_update(
     clean_untracked: bool = False,
     block_updates: bool = False,
 ) -> tuple[bool, str]:
-    """Prepare an update and launch its worker outside the bot service cgroup."""
+    """Prepare an update and start the installed updater service template."""
     root = _resolve_project_root(project_root)
     if _repository_guard_is_active():
         return False, (
             "Обновление временно недоступно: Yadreno Admin проверяет изменения "
             "защищённого tool call. Повторите после его завершения."
         )
+    try:
+        install_registered_updater_service(
+            project_root=root,
+            service_name=service_name,
+        )
+    except Exception as exc:
+        logger.exception("Cannot register managed updater service")
+        return False, f"Не удалось зарегистрировать updater-service: {exc}"
     snapshot: PreparedUpdateSnapshot | None = None
     try:
         with update_operation_lock(root):
@@ -2360,42 +2675,35 @@ def schedule_admin_update(
                 actor=actor,
                 project_root=root,
             )
-            runner = snapshot.snapshot_dir / ROLLBACK_RUNNER_FILENAME
-            command = [
-                "systemd-run",
-                "--quiet",
-                "--collect",
-                f"--unit=yadreno-vpn-update-{snapshot.snapshot_id[:23].lower()}",
-                "--property=Type=exec",
-                sys.executable,
-                str(runner),
-                "apply-update",
-                "--project-root",
-                str(root),
-                "--snapshot-id",
+            unit = _stage_registered_service_request(
+                root,
                 snapshot.snapshot_id,
-                "--target",
-                target_commit,
-                "--strategy",
-                strategy,
-                "--service-name",
-                service_name,
-                "--admin-id",
-                str(int(admin_id)),
-                "--start-delay",
-                "0",
-            ]
-            if clean_untracked:
-                command.append("--clean-untracked")
-            if block_updates:
-                command.append("--block-updates")
-            result = _run_command(command, cwd=root, timeout=30)
+                operation="update",
+                admin_id=admin_id,
+                target=target_commit,
+                strategy=strategy,
+                clean_untracked=bool(clean_untracked),
+                block_updates=bool(block_updates),
+                start_delay=2,
+            )
+            result = _run_command(
+                ["systemctl", "start", "--no-block", unit],
+                cwd=root,
+                timeout=30,
+            )
             if result.returncode != 0:
                 output = (result.stdout + result.stderr).strip()
+                _discard_registered_service_request(root, snapshot.snapshot_id)
                 discard_prepared_snapshot(snapshot.snapshot_id, project_root=root)
-                return False, output or "Не удалось запустить update worker"
+                return False, output or "Не удалось запустить зарегистрированный updater service"
     except Exception as exc:
         logger.exception("Cannot schedule managed administrator update")
+        if snapshot is not None:
+            try:
+                _discard_registered_service_request(root, snapshot.snapshot_id)
+                discard_prepared_snapshot(snapshot.snapshot_id, project_root=root)
+            except Exception:
+                logger.exception("Cannot discard an unscheduled update snapshot")
         return False, str(exc)
     if snapshot is None:
         return False, "Не удалось подготовить snapshot обновления"
@@ -2409,44 +2717,41 @@ def schedule_admin_rollback(
     project_root: str | Path | None = None,
     service_name: str = SERVICE_NAME,
 ) -> tuple[bool, str]:
-    """Start a rollback worker in a transient systemd unit."""
+    """Start a rollback through the installed updater service template."""
     root = _resolve_project_root(project_root)
     point = get_rollback_point(
         snapshot_id,
         project_root=root,
         verify_integrity=True,
     )
-    runner = point.snapshot_dir / ROLLBACK_RUNNER_FILENAME
-    if not runner.is_file():
-        return False, "Автономный исполнитель отката отсутствует в backup."
-    unit = f"yadreno-vpn-rollback-{snapshot_id[:23].lower()}"
-    result = _run_command(
-        [
-            "systemd-run",
-            "--quiet",
-            "--collect",
-            f"--unit={unit}",
-            "--property=Type=exec",
-            sys.executable,
-            str(runner),
-            "rollback",
-            "--project-root",
-            str(root),
-            "--snapshot-id",
-            snapshot_id,
-            "--service-name",
-            service_name,
-            "--admin-id",
-            str(int(admin_id)),
-            "--start-delay",
-            "2",
-        ],
-        cwd=root,
-        timeout=30,
-    )
-    if result.returncode != 0:
-        output = (result.stdout + result.stderr).strip()
-        return False, output or "Не удалось запустить transient systemd unit."
+    try:
+        install_registered_updater_service(
+            project_root=root,
+            service_name=service_name,
+        )
+        unit = _stage_registered_service_request(
+            root,
+            point.snapshot_id,
+            operation="rollback",
+            admin_id=admin_id,
+            start_delay=2,
+        )
+        result = _run_command(
+            ["systemctl", "start", "--no-block", unit],
+            cwd=root,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            output = (result.stdout + result.stderr).strip()
+            _discard_registered_service_request(root, point.snapshot_id)
+            return False, output or "Не удалось запустить зарегистрированный updater service."
+    except Exception as exc:
+        logger.exception("Cannot schedule managed administrator rollback")
+        try:
+            _discard_registered_service_request(root, point.snapshot_id)
+        except Exception:
+            logger.exception("Cannot discard an unscheduled rollback request")
+        return False, str(exc)
     return True, unit
 
 
@@ -2677,6 +2982,15 @@ def _build_parser() -> argparse.ArgumentParser:
     apply_update.add_argument("--clean-untracked", action="store_true")
     apply_update.add_argument("--block-updates", action="store_true")
     apply_update.add_argument("--start-delay", type=float, default=0)
+
+    service_request = subparsers.add_parser("service-request")
+    service_request.add_argument("--project-root", required=True)
+    service_request.add_argument("--snapshot-id", required=True)
+    service_request.add_argument("--service-name", default=SERVICE_NAME)
+
+    install_service = subparsers.add_parser("install-service")
+    install_service.add_argument("--project-root", required=True)
+    install_service.add_argument("--service-name", default=SERVICE_NAME)
     return parser
 
 
@@ -2750,6 +3064,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(result.message)
             return 0 if result.success else 1
+        if args.command == "service-request":
+            result = _run_registered_service_request(
+                args.snapshot_id,
+                project_root=args.project_root,
+                service_name=args.service_name,
+            )
+            print(result.message)
+            return 0 if result.success else 1
+        if args.command == "install-service":
+            unit_path = install_registered_updater_service(
+                project_root=args.project_root,
+                service_name=args.service_name,
+            )
+            print(unit_path)
+            return 0
     except UpdateRollbackError as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import inspect
 import logging
@@ -87,6 +88,8 @@ class CustomExtensionsLoadResult:
     failed: dict[str, str] = field(default_factory=dict)
     skipped: bool = False
     reason: str = ''
+    loader_enabled: bool = False
+    directory_fingerprint: str = ''
 
 
 _REGISTRATION_KINDS = (
@@ -403,17 +406,19 @@ def load_custom_extensions(
     _ensure_extension_mutation_allowed('load_custom_extensions')
     global _LAST_LOAD_RESULT
 
-    result = CustomExtensionsLoadResult()
-
     if enabled is None:
         enabled = is_custom_extensions_enabled()
+    base_dir = Path(extensions_dir) if extensions_dir is not None else CUSTOM_EXTENSIONS_DIR
+    result = CustomExtensionsLoadResult(
+        loader_enabled=bool(enabled),
+        directory_fingerprint=_extension_directory_fingerprint(base_dir),
+    )
     if not enabled:
         result.skipped = True
         result.reason = 'disabled'
         _LAST_LOAD_RESULT = result
         return result
 
-    base_dir = Path(extensions_dir) if extensions_dir is not None else CUSTOM_EXTENSIONS_DIR
     if not base_dir.exists():
         result.skipped = True
         result.reason = 'directory_missing'
@@ -467,17 +472,32 @@ def get_custom_extensions_diagnostics(
     enabled: bool | None = None,
 ) -> dict[str, Any]:
     """Returns a read-only snapshot for admin diagnostics of extensions."""
+    from database.requests import get_setting
+
+    configured_value = get_setting(CUSTOM_EXTENSIONS_ENABLED_SETTING, '0')
     if enabled is None:
-        enabled = is_custom_extensions_enabled()
+        enabled = _as_bool(configured_value)
 
     base_dir = Path(extensions_dir) if extensions_dir is not None else CUSTOM_EXTENSIONS_DIR
     directory_status = _extension_directory_status(base_dir)
     files = _scan_extension_files(base_dir) if directory_status == 'ok' else []
+    current_fingerprint = _extension_directory_fingerprint(base_dir)
+    configured_enabled = bool(enabled)
+    runtime_loader_enabled = bool(_LAST_LOAD_RESULT.loader_enabled)
+    restart_required = configured_enabled != runtime_loader_enabled
+    if configured_enabled and (
+        current_fingerprint != _LAST_LOAD_RESULT.directory_fingerprint
+    ):
+        restart_required = True
     from bot.utils.extension_settings import get_all_extension_settings
     from bot.utils.page_flow import get_page_flow_runtime_diagnostics
 
     return {
-        'enabled': bool(enabled),
+        'enabled': configured_enabled,
+        'configured_value': configured_value,
+        'configured_enabled': configured_enabled,
+        'runtime_loader_enabled': runtime_loader_enabled,
+        'restart_required': restart_required,
         'directory': str(base_dir),
         'directory_status': directory_status,
         'files': files,
@@ -1470,12 +1490,30 @@ def _scan_extension_files(base_dir: Path) -> list[dict[str, str]]:
     return files
 
 
+def _extension_directory_fingerprint(base_dir: Path) -> str:
+    """Hash extension filenames and bytes without exposing their source."""
+    digest = hashlib.sha256()
+    status = _extension_directory_status(base_dir)
+    digest.update(status.encode('utf-8'))
+    if status != 'ok':
+        return digest.hexdigest()
+    for path in sorted(base_dir.glob('*.py')):
+        digest.update(path.name.encode('utf-8'))
+        try:
+            digest.update(path.read_bytes())
+        except OSError as exc:
+            digest.update(f'error:{type(exc).__name__}'.encode('utf-8'))
+    return digest.hexdigest()
+
+
 def _load_result_to_dict(result: CustomExtensionsLoadResult) -> dict[str, Any]:
     return {
         'loaded': list(result.loaded),
         'failed': dict(result.failed),
         'skipped': bool(result.skipped),
         'reason': str(result.reason or ''),
+        'loader_enabled': bool(result.loader_enabled),
+        'directory_fingerprint': str(result.directory_fingerprint or ''),
     }
 
 

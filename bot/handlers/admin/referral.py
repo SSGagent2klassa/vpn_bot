@@ -115,21 +115,38 @@ async def admin_referral(callback: CallbackQuery, state: FSMContext):
     await show_referral_menu(callback, state)
 
 
-@router.callback_query(F.data == "admin_referral_toggle")
-async def referral_toggle(callback: CallbackQuery, state: FSMContext):
-    """Switching the referral system."""
+async def _set_referral_enabled(
+    callback: CallbackQuery,
+    state: FSMContext,
+    target_enabled: bool | None,
+) -> None:
+    """Set the referral system state and redraw its administrator screen."""
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    
-    current = is_referral_enabled()
-    new_value = '0' if current else '1'
-    update_referral_setting('referral_enabled', new_value)
-    
-    status = "включена ✅" if new_value == '1' else "выключена"
-    await callback.answer(f"Реферальная система {status}")
-    
+
+    current = bool(is_referral_enabled())
+    desired = not current if target_enabled is None else target_enabled
+    if desired == current:
+        status = "уже включена" if desired else "уже выключена"
+        await callback.answer(f"Реферальная система {status}")
+        return
+
+    update_referral_setting('referral_enabled', '1' if desired else '0')
     await show_referral_menu(callback, state)
+
+
+@router.callback_query(F.data.regexp(r"^admin_referral_set:[01]$"))
+async def referral_set(callback: CallbackQuery, state: FSMContext):
+    """Set the referral system to the explicitly selected state."""
+    target_enabled = str(callback.data).rsplit(':', 1)[1] == '1'
+    await _set_referral_enabled(callback, state, target_enabled)
+
+
+@router.callback_query(F.data == "admin_referral_toggle")
+async def referral_toggle(callback: CallbackQuery, state: FSMContext):
+    """Keep already sent one-button referral controls compatible."""
+    await _set_referral_enabled(callback, state, None)
 
 
 @router.callback_query(F.data == "admin_referral_toggle_type")
@@ -190,33 +207,62 @@ async def referral_level_view(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(F.data.regexp(r"^admin_referral_level_toggle:(\d+)$"))
-async def referral_level_toggle(callback: CallbackQuery, state: FSMContext):
-    """Level switching."""
+async def _set_referral_level_enabled(
+    callback: CallbackQuery,
+    state: FSMContext,
+    *,
+    level_num: int,
+    target_enabled: bool | None,
+) -> None:
+    """Set one referral level state and redraw its administrator screen."""
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    
-    level_num = int(callback.data.split(':')[1])
+
     levels = get_referral_levels()
-    
     level = None
     for l in levels:
         if l['level_number'] == level_num:
             level = l
             break
-    
+
     if not level:
         await callback.answer("Уровень не найден", show_alert=True)
         return
-    
-    new_enabled = not level['enabled']
-    update_referral_level(level_num, level['percent'], new_enabled)
-    
-    status = "включён ✅" if new_enabled else "выключен"
-    await callback.answer(f"Уровень {level_num} {status}")
-    
+
+    current = bool(level['enabled'])
+    desired = not current if target_enabled is None else target_enabled
+    if desired == current:
+        status = "уже включён" if desired else "уже выключен"
+        await callback.answer(f"Уровень {level_num} {status}")
+        return
+
+    update_referral_level(level_num, level['percent'], desired)
     await referral_level_view(callback, state)
+
+
+@router.callback_query(F.data.regexp(r"^admin_referral_level_set:(\d+):([01])$"))
+async def referral_level_set(callback: CallbackQuery, state: FSMContext):
+    """Set one referral level to the explicitly selected state."""
+    _, level_num, raw_state = str(callback.data).rsplit(':', 2)
+    await _set_referral_level_enabled(
+        callback,
+        state,
+        level_num=int(level_num),
+        target_enabled=raw_state == '1',
+    )
+
+
+@router.callback_query(F.data.regexp(r"^admin_referral_level_toggle:(\d+)$"))
+async def referral_level_toggle(callback: CallbackQuery, state: FSMContext):
+    """Keep already sent one-button referral level controls compatible."""
+    level_num = int(str(callback.data).rsplit(':', 1)[1])
+    await _set_referral_level_enabled(
+        callback,
+        state,
+        level_num=level_num,
+        target_enabled=None,
+    )
 
 
 @router.callback_query(F.data.regexp(r"^admin_referral_level_percent:(\d+)$"))

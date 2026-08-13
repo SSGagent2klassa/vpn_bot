@@ -1,7 +1,7 @@
 """
 Update blocking management.
 
-When a blocking update is installed - regular updates
+When a blocking update is installed - ordered updates
 and auto-check are disabled until the unlock conditions are met.
 
 Settings in settings:
@@ -21,9 +21,9 @@ DEFAULT_BLOCKED_MESSAGE = (
     "🔒 <b>Обновления приостановлены</b>\n\n"
     "Для продолжения автоматических обновлений "
     "необходимо выполнить определённые действия в боте.\n\n"
-    "Доступные режимы обновления:\n"
+    "Аварийные режимы восстановления:\n"
     "• Команда /update — экстренное обновление\n"
-    "• Принудительная перезапись в настройках\n\n"
+    "• Консольная команда bash install.sh reset — жёсткая перезапись\n\n"
     "После выполнения требуемых действий блокировка снимется автоматически."
 )
 

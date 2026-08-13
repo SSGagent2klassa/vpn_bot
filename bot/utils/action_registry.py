@@ -176,25 +176,6 @@ def _key_details_traffic_exhausted(ctx: dict) -> bool:
     return ctx.get('traffic_exhausted') is True
 
 
-def _key_details_has_sub_id(ctx: dict) -> bool:
-    return ctx.get('has_sub_id') is True
-
-
-def _resolve_key_show_key(ctx: dict) -> Optional[dict]:
-    """Button to show regular VPN key."""
-    key_id = _get_key_details_id(ctx)
-    if not key_id:
-        return None
-    if not _key_details_is_active(ctx):
-        return None
-    if _key_details_is_unconfigured(ctx) or _key_details_traffic_exhausted(ctx):
-        return None
-    if _key_details_has_sub_id(ctx):
-        return None
-
-    return {"callback_data": f"key_show:{key_id}"}
-
-
 def _resolve_key_show_subscription(ctx: dict) -> Optional[dict]:
     """Button to show subscription link."""
     key_id = _get_key_details_id(ctx)
@@ -204,9 +185,6 @@ def _resolve_key_show_subscription(ctx: dict) -> Optional[dict]:
         return None
     if _key_details_is_unconfigured(ctx) or _key_details_traffic_exhausted(ctx):
         return None
-    if not _key_details_has_sub_id(ctx):
-        return None
-
     return {"callback_data": f"key_show:{key_id}"}
 
 
@@ -390,7 +368,6 @@ SYSTEM_BUTTONS: Dict[str, Callable[[dict], Optional[dict]]] = {
     "btn_enter_promo": _resolve_enter_promo,
     "btn_renew_enter_promo": _resolve_renew_enter_promo,
     "btn_renew_back": _resolve_renew_back,
-    "btn_key_show_key": _resolve_key_show_key,
     "btn_key_show_subscription": _resolve_key_show_subscription,
     "btn_key_configure": _resolve_key_configure,
     "btn_key_renew": _resolve_key_renew,
@@ -399,6 +376,7 @@ SYSTEM_BUTTONS: Dict[str, Callable[[dict], Optional[dict]]] = {
     "btn_key_rename": _resolve_key_rename,
     "btn_support_reply": _resolve_support_reply,
     "btn_intent_provider_crypto": lambda ctx: _resolve_intent_provider(ctx, "crypto"),
+    "btn_intent_provider_cryptobot": lambda ctx: _resolve_intent_provider(ctx, "cryptobot"),
     "btn_intent_provider_stars": lambda ctx: _resolve_intent_provider(ctx, "stars"),
     "btn_intent_provider_cards": lambda ctx: _resolve_intent_provider(ctx, "cards"),
     "btn_intent_provider_yookassa_qr": lambda ctx: _resolve_intent_provider(ctx, "yookassa_qr"),
@@ -430,7 +408,6 @@ def _resolve_context_collection(context_key: str, context: dict) -> list[dict]:
 SYSTEM_COLLECTIONS: Dict[str, Callable[[dict], list[dict]]] = {
     "btn_tariff_items": lambda ctx: _resolve_context_collection("tariff_button_items", ctx),
     "btn_server_items": lambda ctx: _resolve_context_collection("server_button_items", ctx),
-    "btn_protocol_items": lambda ctx: _resolve_context_collection("protocol_button_items", ctx),
     "btn_key_items": lambda ctx: _resolve_context_collection("key_button_items", ctx),
     "btn_tariff_group_items": lambda ctx: _resolve_context_collection("tariff_group_button_items", ctx),
 }

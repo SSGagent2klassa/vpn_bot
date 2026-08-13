@@ -288,6 +288,12 @@ def execute_base_currency_switch_record(
                 canceled_order_ids,
             )
             conn.execute(
+                f"UPDATE payment_auto_checks SET state = 'canceled', "
+                f"next_check_at = NULL, updated_at = CURRENT_TIMESTAMP "
+                f"WHERE order_id IN ({placeholders})",
+                canceled_order_ids,
+            )
+            conn.execute(
                 f"UPDATE promo_redemptions SET status = 'canceled' "
                 f"WHERE status = 'reserved' AND order_id IN ({placeholders})",
                 canceled_order_ids,

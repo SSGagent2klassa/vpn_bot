@@ -25,6 +25,7 @@ _BUILTIN_PAYMENT_CURRENCIES: Mapping[str, str] = {
     'cards': 'RUB',
     'cardlink': 'RUB',
     'crypto': 'USDT',
+    'cryptobot': 'BASE',
     'demo': 'RUB',
     'platega': 'RUB',
     'promo_free': 'BASE',

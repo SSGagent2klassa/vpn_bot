@@ -23,7 +23,7 @@ __all__ = [
 
 SERVER_SELECT_FIELDS = """
     id, name, host, port, web_base_path, login, password, is_active, protocol,
-    api_token, panel_version, panel_api_profile, panel_checked_at
+    api_token, panel_version, panel_checked_at
 """
 
 def get_all_servers() -> List[Dict[str, Any]]:
@@ -87,7 +87,6 @@ def add_server(
     group_id: int = 1,
     api_token: Optional[str] = None,
     panel_version: Optional[str] = None,
-    panel_api_profile: Optional[str] = None,
 ) -> int:
     """
     Adds a new VPN server.
@@ -103,25 +102,24 @@ def add_server(
         group_id: tariff group ID (default 1 - “Main”)
         api_token: Existing 3X-UI Bearer token, if provided by the administrator
         panel_version: Version detected during the connection test
-        panel_api_profile: API profile detected during the connection test
         
     Returns:
         ID of the created server
     """
     panel_checked_at = None
-    if panel_version or panel_api_profile:
+    if panel_version:
         panel_checked_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
     with get_db() as conn:
         cursor = conn.execute("""
             INSERT INTO servers (
                 name, host, port, web_base_path, login, password, is_active,
-                protocol, api_token, panel_version, panel_api_profile, panel_checked_at
+                protocol, api_token, panel_version, panel_checked_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
         """, (
             name, host, port, web_base_path, login, password, protocol,
-            api_token, panel_version, panel_api_profile, panel_checked_at,
+            api_token, panel_version, panel_checked_at,
         ))
         server_id = cursor.lastrowid
         
@@ -148,7 +146,7 @@ def update_server(server_id: int, **fields) -> bool:
     allowed_fields = {
         'name', 'host', 'port', 'web_base_path', 'login', 'password',
         'is_active', 'protocol', 'api_token', 'panel_version',
-        'panel_api_profile', 'panel_checked_at',
+        'panel_checked_at',
     }
     fields = {k: v for k, v in fields.items() if k in allowed_fields}
     
@@ -171,7 +169,7 @@ def update_server(server_id: int, **fields) -> bool:
 
 def update_server_api_token(server_id: int, token: Optional[str]) -> bool:
     """
-    Atomically updates the server's Bearer token (3x-ui v3.0+).
+    Atomically updates the server's Bearer token (official 3X-UI v3.3.0+).
 
     Token=None is passed for cleaning (for example, after the token is rotated by the admin
     in the UI panel - our saved token becomes invalid and must be erased,
@@ -192,7 +190,10 @@ def update_server_api_token(server_id: int, token: Optional[str]) -> bool:
         success = cursor.rowcount > 0
         if success:
             if token:
-                logger.info(f"Сохранён api_token для сервера ID {server_id} (3x-ui v3.0+)")
+                logger.info(
+                    "Сохранён Bearer api_token для сервера ID %s (3X-UI 3.3.0+)",
+                    server_id,
+                )
             else:
                 logger.info(f"Очищен api_token для сервера ID {server_id}")
         return success
@@ -201,15 +202,12 @@ def update_server_api_token(server_id: int, token: Optional[str]) -> bool:
 def update_server_panel_info(
     server_id: int,
     version: Optional[str],
-    api_profile: Optional[str],
 ) -> bool:
-    """
-    Updates the 3x-ui panel API diagnostic cache.
+    """Updates the supported 3X-UI version diagnostic cache.
 
     Args:
         server_id: Server ID
         version: Panel version, if it was possible to determine
-        api_profile: 'legacy_inbounds' or 'clients_api'
 
     Returns:
         True if the server exists
@@ -220,17 +218,16 @@ def update_server_panel_info(
             """
             UPDATE servers
             SET panel_version = ?,
-                panel_api_profile = ?,
                 panel_checked_at = ?
             WHERE id = ?
             """,
-            (version, api_profile, checked_at, server_id)
+            (version, checked_at, server_id)
         )
         success = cursor.rowcount > 0
         if success:
             logger.info(
                 f"Обновлена диагностика 3x-ui для сервера ID {server_id}: "
-                f"version={version or 'unknown'}, profile={api_profile or 'unknown'}"
+                f"version={version or 'unknown'}"
             )
         return success
 
@@ -261,7 +258,16 @@ def delete_server(server_id: int) -> bool:
     """
     with get_db() as conn:
         # First, we unbind the keys from this server so as not to break the Foreign Key
-        conn.execute("UPDATE vpn_keys SET server_id = NULL WHERE server_id = ?", (server_id,))
+        conn.execute(
+            """
+            UPDATE vpn_keys
+            SET server_id = NULL,
+                panel_email = NULL,
+                sub_id = NULL
+            WHERE server_id = ?
+            """,
+            (server_id,),
+        )
         
         cursor = conn.execute("DELETE FROM servers WHERE id = ?", (server_id,))
         success = cursor.rowcount > 0

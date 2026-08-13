@@ -269,7 +269,12 @@ def _finish_payment_auto_check(order_id: str) -> None:
 
     row = get_payment_auto_check(order_id)
     current_state = str((row or {}).get("state") or "")
-    if current_state in {"active", "provider_succeeded"}:
+    if current_state in {
+        "active",
+        "provider_succeeded",
+        "exhausted",
+        "completion_failed",
+    }:
         update_payment_auto_check(
             order_id,
             state="completed",

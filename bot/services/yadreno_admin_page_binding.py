@@ -298,12 +298,10 @@ def build_yaa_binding_runtime_context(binding: YaaPageBinding) -> dict[str, Any]
             "source": "yaa",
             "page_key": binding.page_key,
             "page_flow": _build_page_flow(binding.page_key, binding.route_key),
-            "database_path": "database/vpn_bot.db",
             "backup": {"created": True, "path": binding.backup_path},
             "stored_page": stored_page,
             "visible_keyboard": visible_keyboard,
             "runtime": _build_runtime(binding),
-            "task_format": "telegram_html",
         }
         if binding.attachment:
             invocation["attachment"] = copy.deepcopy(binding.attachment)

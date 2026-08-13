@@ -26,6 +26,31 @@ def _repository_update_blocked_message() -> Optional[str]:
     )
 
 
+def _ordered_update_blocked_message(update_mode: str) -> Optional[str]:
+    """Return a fail-closed error for an ordered mode while its gate is active."""
+    try:
+        from bot.services.update_rollback import (
+            ORDERED_UPDATE_MODES,
+            UpdateRollbackError,
+            ensure_ordered_update_unblocked,
+        )
+    except Exception as exc:
+        logger.exception("Cannot load the ordered update gate")
+        return f"❌ Не удалось проверить блокировку обновлений: {exc}"
+
+    if update_mode not in ORDERED_UPDATE_MODES:
+        return None
+
+    try:
+        ensure_ordered_update_unblocked()
+    except UpdateRollbackError as exc:
+        return str(exc)
+    except Exception as exc:
+        logger.exception("Cannot evaluate the ordered update gate")
+        return f"❌ Не удалось проверить блокировку обновлений: {exc}"
+    return None
+
+
 def get_project_root() -> str:
     """
     Gets the root directory of the project.
@@ -151,6 +176,9 @@ def _run_snapshotted_git_mutation(
         from bot.services.update_rollback import update_operation_lock
 
         with update_operation_lock(get_project_root()):
+            blocked_message = _ordered_update_blocked_message(update_mode)
+            if blocked_message:
+                return False, "", blocked_message
             snapshot, snapshot_error = _prepare_update_snapshot(
                 update_mode=update_mode,
                 requested_target=requested_target,
@@ -159,11 +187,23 @@ def _run_snapshotted_git_mutation(
             if snapshot is None:
                 return False, "", snapshot_error
             success, output = run_git_command(git_args, timeout=timeout)
+            block_error = None
+            if success and update_mode == "admin_force_blocking":
+                try:
+                    from bot.utils.update_block import set_update_blocked
+
+                    set_update_blocked()
+                except Exception as exc:
+                    logger.exception("Cannot activate the blocking update flag")
+                    block_error = (
+                        "❌ Блокирующая версия установлена, но её защитный "
+                        f"флаг не удалось сохранить: {exc}"
+                    )
             finalize_error = _finalize_update_snapshot(
                 snapshot,
                 git_succeeded=success,
             )
-            return success, output, finalize_error
+            return success, output, block_error or finalize_error
     except Exception as exc:
         logger.exception("Cannot run protected Git update mutation")
         return False, "", f"❌ Обновление не выполнено: {exc}"
@@ -212,45 +252,49 @@ def set_remote_url(url: str) -> Tuple[bool, str]:
         return run_git_command(['remote', 'add', 'origin', url])
 
 
-def get_pending_commits_list() -> Tuple[bool, List[Dict[str, str]]]:
+def get_pending_update_plan() -> Tuple[
+    bool,
+    List[Dict[str, str]],
+    Optional[str],
+]:
     """
-    Gets a list of commits between HEAD and origin/branch.
-    
-    Runs git fetch before checking out.
-    
+    Resolve one exact remote target and its commits after a single fetch.
+
     Returns:
-        (success, commits) — list of dictionaries [{"hash": str, "message": str}, ...]
-        from old to new (--reverse)
+        (success, commits, target_commit). Commits are ordered from old to new.
     """
     # Receiving updates from the server
     success, output = run_git_command(['fetch', 'origin'], timeout=60)
     if not success:
         logger.error(f"Ошибка fetch при получении списка коммитов: {output}")
-        return False, []
+        return False, [], None
     
     # Getting the current branch
     branch = get_current_branch()
     if not branch:
         logger.error("Не удалось определить текущую ветку")
-        return False, []
+        return False, [], None
     
     # Checking if the remote branch exists
-    success, _ = run_git_command(['rev-parse', '--verify', f'origin/{branch}'])
+    success, target_commit = run_git_command(
+        ['rev-parse', '--verify', f'origin/{branch}^{{commit}}']
+    )
     if not success:
         logger.warning(f"Удаленная ветка origin/{branch} не найдена. Обновления недоступны.")
-        return True, []
+        return True, [], None
+    target_commit = target_commit.strip()
         
     # We get a list of commits from old to new
     success, output = run_git_command([
-        'log', f'HEAD..origin/{branch}', '--format=%H|%s', '--reverse'
+        'log', f'HEAD..{target_commit}', '--format=%H|%s', '--reverse'
     ])
     
     if not success:
         logger.error(f"Ошибка получения списка коммитов: {output}")
-        return False, []
+        return False, [], None
     
     if not output.strip():
-        return True, []
+        return True, [], target_commit
     
     commits = []
     for line in output.strip().split('\n'):
@@ -262,7 +306,13 @@ def get_pending_commits_list() -> Tuple[bool, List[Dict[str, str]]]:
             })
     
     logger.debug(f"Найдено {len(commits)} ожидающих коммитов")
-    return True, commits
+    return True, commits, target_commit
+
+
+def get_pending_commits_list() -> Tuple[bool, List[Dict[str, str]]]:
+    """Return pending commits while keeping the existing public call shape."""
+    success, commits, _ = get_pending_update_plan()
+    return success, commits
 
 
 def find_first_blocking_commit(commits: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
@@ -396,7 +446,9 @@ def pull_updates(
     if blocked_message:
         return False, blocked_message
 
-    success, status = run_git_command(['status', '--porcelain'])
+    success, status = run_git_command(
+        ['status', '--porcelain', '--untracked-files=no']
+    )
     if success and status.strip():
         return False, "❌ Есть локальные изменения. Сделайте commit или stash перед обновлением."
 
@@ -428,9 +480,9 @@ def force_pull_updates(
     """
     Performs a forced git fetch and reset, completely overwriting local changes.
     
-    The function itself does NOT check for blocking commits - that is the responsibility of the calling code
-    (the handler in system.py checks for blocking commits before calling).
-    Always updates to the latest version of origin/branch.
+    Administrator force overwrite remains an ordered mode: it refuses an
+    active installed block and stops at the first pending blocking commit.
+    Console reset/reinstall and the hidden /update command use separate modes.
     
     Returns:
         (success, message)
@@ -439,24 +491,46 @@ def force_pull_updates(
     if blocked_message:
         return False, blocked_message
 
-    # Download all changes
-    success, output = run_git_command(['fetch', 'origin'], timeout=120)
-    if not success:
-        return False, f"❌ Ошибка fetch:\n{output}"
-    
-    branch = get_current_branch()
-    if not branch:
-        branch = "main"
+    blocked_message = _ordered_update_blocked_message(update_mode)
+    if blocked_message:
+        return False, blocked_message
 
-    target = f'origin/{branch}'
-    success, output = run_git_command(['rev-parse', '--verify', f'{target}^{{commit}}'])
-    if not success:
-        return False, f"❌ Целевой коммит обновления недоступен:\n{output}"
+    target_commit = None
+    if update_mode == "admin_force":
+        success, pending_commits, target_commit = get_pending_update_plan()
+        if not success:
+            return False, (
+                "❌ Не удалось проверить порядок обновлений. "
+                "Принудительная перезапись отменена."
+            )
+        blocking_commit = find_first_blocking_commit(pending_commits)
+        if blocking_commit:
+            return pull_to_commit(
+                blocking_commit["hash"],
+                update_mode="admin_force_blocking",
+                actor=actor,
+            )
+
+    # Download all changes
+    if target_commit is None and update_mode != "admin_force":
+        success, output = run_git_command(['fetch', 'origin'], timeout=120)
+        if not success:
+            return False, f"❌ Ошибка fetch:\n{output}"
+        branch = get_current_branch() or "main"
+        success, target_commit = run_git_command(
+            ['rev-parse', '--verify', f'origin/{branch}^{{commit}}']
+        )
+        if not success:
+            return False, f"❌ Целевой коммит обновления недоступен:\n{target_commit}"
+
+    if not target_commit:
+        return False, "❌ Целевой коммит обновления недоступен."
+    target_commit = target_commit.strip()
 
     success, output, snapshot_error = _run_snapshotted_git_mutation(
-        ['reset', '--hard', target],
+        ['reset', '--hard', target_commit],
         update_mode=update_mode,
-        requested_target=target,
+        requested_target=target_commit,
         actor=actor,
         timeout=120,
     )

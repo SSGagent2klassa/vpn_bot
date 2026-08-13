@@ -12,12 +12,10 @@ class RenameKey(StatesGroup):
 
 class ReplaceKey(StatesGroup):
     users_server = State()
-    users_inbound = State()
     confirm = State()
 
 class NewKeyConfig(StatesGroup):
     waiting_for_server = State()
-    waiting_for_inbound = State()
 
 class PromoInput(StatesGroup):
     waiting_for_code = State()
