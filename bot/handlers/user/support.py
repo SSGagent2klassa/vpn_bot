@@ -8,7 +8,11 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from bot.services.support import extract_support_payload, send_user_message_to_admins
+from bot.services.support import (
+    extract_support_payload,
+    send_user_message_to_admins,
+    support_thread_operation,
+)
 from bot.states.user_states import SupportUserStates
 from bot.utils.page_dynamic_data import build_support_context_values
 from bot.utils.page_renderer import render_page
@@ -19,6 +23,7 @@ from database.requests import (
     get_support_thread,
     is_user_banned,
     record_support_message,
+    SupportThreadClosedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,7 +81,11 @@ async def support_reply_callback(callback: CallbackQuery, state: FSMContext):
         return
 
     thread = get_support_thread(thread_id)
-    if not thread or int(thread["user_telegram_id"]) != callback.from_user.id:
+    if (
+        not thread
+        or int(thread["user_telegram_id"]) != callback.from_user.id
+        or thread.get("status") == "closed"
+    ):
         logger.warning(
             "Unavailable support thread %s requested by user %s",
             thread_id,
@@ -129,23 +138,45 @@ async def process_support_message(message: Message, state: FSMContext):
             return
 
     try:
-        record_support_message(
-            int(thread["id"]),
-            sender_type="user",
-            sender_telegram_id=user_id,
-            recipient_telegram_id=thread.get("assigned_admin_id"),
-            text_html=payload["text_html"],
-            media_type=payload["media_type"],
-            media_file_id=payload["media_file_id"],
-            source_chat_id=payload["source_chat_id"],
-            source_message_id=payload["source_message_id"],
+        async with support_thread_operation(int(thread["id"])):
+            thread = get_support_thread(int(thread["id"]))
+            if (
+                not thread
+                or int(thread["user_telegram_id"]) != user_id
+                or thread.get("status") == "closed"
+            ):
+                await render_page(
+                    message,
+                    page_key="support_thread_unavailable",
+                    force_new=True,
+                )
+                await state.clear()
+                return
+            record_support_message(
+                int(thread["id"]),
+                sender_type="user",
+                sender_telegram_id=user_id,
+                recipient_telegram_id=thread.get("assigned_admin_id"),
+                text_html=payload["text_html"],
+                media_type=payload["media_type"],
+                media_file_id=payload["media_file_id"],
+                source_chat_id=payload["source_chat_id"],
+                source_message_id=payload["source_message_id"],
+            )
+            result = await send_user_message_to_admins(
+                message.bot,
+                thread=thread,
+                user=user,
+                source_message=message,
+            )
+    except SupportThreadClosedError:
+        await state.clear()
+        await render_page(
+            message,
+            page_key="support_thread_unavailable",
+            force_new=True,
         )
-        result = await send_user_message_to_admins(
-            message.bot,
-            thread=thread,
-            user=user,
-            source_message=message,
-        )
+        return
     except Exception:
         logger.exception("Failed to process support message for user %s", user_id)
         await state.clear()

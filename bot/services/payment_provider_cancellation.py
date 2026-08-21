@@ -207,7 +207,6 @@ async def cancel_pending_cryptobot_for_base_switch() -> int:
                 bot=None,
                 notify_user=False,
                 show_primary_result=False,
-                payment_type="cryptobot",
             )
             if not completed.ok or not completed.payment_completed:
                 raise CryptoBotPaymentConfirmed(
@@ -326,7 +325,6 @@ async def _reconcile_cryptobot_before_token_replacement_locked(
             background=bot is not None,
             notify_user=bot is not None,
             show_primary_result=bot is not None,
-            payment_type="cryptobot",
         )
         paid += 1
         if not result.payment_completed:

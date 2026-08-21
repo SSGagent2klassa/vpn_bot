@@ -126,7 +126,7 @@ async def activate_selected_trial(
 
 async def _execute_trial_activate(request: CoreActionRequest) -> None:
     """Creates one claimed trial draft through the shared key setup flow."""
-    from bot.handlers.user.payments.keys_config import start_new_key_config
+    from bot.handlers.user.payments.keys_config import run_new_key_setup_flow
     from bot.services.trials import activate_trial_offer
     from database.requests import (
         find_order_by_order_id,
@@ -224,13 +224,13 @@ async def _execute_trial_activate(request: CoreActionRequest) -> None:
             await target.message.delete()
         except Exception:
             pass
-    await start_new_key_config(
+    await run_new_key_setup_flow(
         target_message,
-        state,
         order_id,
-        key_id,
+        state=state,
         owner_telegram_id=request.telegram_id,
         owner_username=target.from_user.username,
+        force_new=True,
     )
 
 

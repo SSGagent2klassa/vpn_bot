@@ -127,6 +127,8 @@ def normalize_core_action_params(action: Any, params: Any = None) -> dict[str, A
     normalized = dict(params)
     if action_name in KEY_ID_ACTIONS:
         allowed = {'key_id'}
+    elif action_name == 'key.purchase.start':
+        allowed = {'tariff_id'}
     elif action_name in TRIAL_OFFER_ACTIONS:
         allowed = {'offer_id'}
     else:
@@ -146,6 +148,13 @@ def normalize_core_action_params(action: Any, params: Any = None) -> dict[str, A
         if isinstance(offer_id, bool) or not isinstance(offer_id, int) or offer_id <= 0:
             raise ValueError(f'{action_name} offer_id must be a positive integer')
         return {'offer_id': offer_id}
+    if action_name == 'key.purchase.start':
+        if 'tariff_id' not in normalized:
+            return {}
+        tariff_id = normalized.get('tariff_id')
+        if isinstance(tariff_id, bool) or not isinstance(tariff_id, int) or tariff_id <= 0:
+            raise ValueError('key.purchase.start tariff_id must be a positive integer')
+        return {'tariff_id': tariff_id}
     return {}
 
 

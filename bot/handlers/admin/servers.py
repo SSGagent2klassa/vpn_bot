@@ -31,6 +31,10 @@ from database.requests import (
     toggle_server_group
 )
 from bot.utils.admin import is_admin
+from bot.utils.admin_dialog import (
+    render_admin_dialog,
+    render_admin_dialog_from_input,
+)
 from bot.services.admin_monitoring import (
     build_servers_monitoring_text,
     collect_admin_monitoring_snapshot,
@@ -63,7 +67,7 @@ from bot.keyboards.admin import (
 
 logger = logging.getLogger(__name__)
 
-from bot.utils.text import safe_edit_or_send, escape_html
+from bot.utils.text import escape_html, get_message_text_for_storage, safe_edit_or_send
 
 router = Router()
 
@@ -270,12 +274,21 @@ def _masked_server_value(key: str, value: object) -> str:
     return escape_html(str(value if value is not None else '—'))
 
 
-def get_add_step_text(step: int, data: dict, auth_method: str) -> str:
+def get_add_step_text(
+    step: int,
+    data: dict,
+    auth_method: str,
+    *,
+    error: str | None = None,
+) -> str:
     """Generates text for the add server step."""
     param = get_param_by_index(step - 1, auth_method)
     total = get_total_params(auth_method)
     
     lines = [f"📝 <b>Добавление сервера ({step}/{total})</b>\n"]
+
+    if error:
+        lines.append(f"❌ {error}\n")
     
     # Showing already entered data
     for i in range(step - 1):
@@ -292,7 +305,12 @@ def get_add_step_text(step: int, data: dict, auth_method: str) -> str:
     return "\n".join(lines)
 
 
-async def render_add_auth_method(message: Message, state: FSMContext, *, reset: bool) -> None:
+async def render_add_auth_method(
+    message: Message,
+    state: FSMContext,
+    *,
+    reset: bool,
+) -> Message:
     """Shows the authentication choice before any server fields are requested."""
     await state.set_state(AdminStates.add_server_auth_method)
     if reset:
@@ -303,8 +321,9 @@ async def render_add_auth_method(message: Message, state: FSMContext, *, reset: 
             selected_group_id=None,
             connection_test_passed=False,
         )
-    await safe_edit_or_send(
+    return await render_admin_dialog(
         message,
+        state,
         "🔐 <b>Подключение сервера</b>\n\n"
         "🔑 <b>API-ключ</b> — рекомендуемый вариант для 3X-UI 3.3.0 и новее. "
         "Бот работает без входа в аккаунт панели, поэтому в панели можно оставить "
@@ -365,8 +384,9 @@ async def select_server_auth_method(callback: CallbackQuery, state: FSMContext):
     if groups_count > 1:
         groups = get_all_groups()
         await state.set_state(AdminStates.server_select_group)
-        await safe_edit_or_send(
+        await render_admin_dialog(
             callback.message,
+            state,
             "📂 <b>Группа сервера</b>\n\nВыберите группу для нового сервера:",
             reply_markup=group_select_kb(
                 groups,
@@ -381,8 +401,9 @@ async def select_server_auth_method(callback: CallbackQuery, state: FSMContext):
     await state.set_state(states[0])
     await state.update_data(add_step=1, selected_group_id=1)
     text = get_add_step_text(1, server_data, auth_method)
-    await safe_edit_or_send(
+    await render_admin_dialog(
         callback.message,
+        state,
         text,
         reply_markup=add_server_step_kb(1, get_total_params(auth_method)),
     )
@@ -409,7 +430,7 @@ async def server_group_selected(callback: CallbackQuery, state: FSMContext):
         + get_add_step_text(1, server_data, auth_method)
     )
     
-    await safe_edit_or_send(callback.message, 
+    await render_admin_dialog(callback.message, state,
         text,
         reply_markup=add_server_step_kb(1, get_total_params(auth_method))
     )
@@ -440,7 +461,7 @@ async def add_server_back(callback: CallbackQuery, state: FSMContext):
     
     text = get_add_step_text(new_step, data.get('server_data', {}), auth_method)
     
-    await safe_edit_or_send(callback.message, 
+    await render_admin_dialog(callback.message, state,
         text,
         reply_markup=add_server_step_kb(new_step, get_total_params(auth_method))
     )
@@ -455,16 +476,22 @@ async def process_add_step(message: Message, state: FSMContext):
     auth_method = data.get('auth_method', AUTH_LOGIN_PASSWORD)
     states = _get_add_states(auth_method)
     total_params = get_total_params(auth_method)
-    
-    from bot.utils.text import get_message_text_for_storage, safe_edit_or_send
-    
+
     param = get_param_by_index(current_step - 1, auth_method)
     value = get_message_text_for_storage(message, 'plain')
-    
+
     # Validation
     if not param['validate'](value):
-        await safe_edit_or_send(message,
-            f"❌ {param['error']}\n\nПопробуйте ещё раз:"
+        await render_admin_dialog_from_input(
+            message,
+            state,
+            get_add_step_text(
+                current_step,
+                server_data,
+                auth_method,
+                error=param['error'],
+            ),
+            reply_markup=add_server_step_kb(current_step, total_params),
         )
         return
     
@@ -497,9 +524,20 @@ async def process_add_step(message: Message, state: FSMContext):
             # Save the original input purely for display in the next steps
             server_data['panel_url'] = url_str
             
-        except Exception as e:
-            await safe_edit_or_send(message,
-                "❌ Неверный формат ссылки. Убедитесь, что указан хост и по умолчанию подставляется <code>https://</code>.\nПример: <code>123.45.67.89:2053/api/</code>"
+        except Exception:
+            await render_admin_dialog_from_input(
+                message,
+                state,
+                get_add_step_text(
+                    current_step,
+                    server_data,
+                    auth_method,
+                    error=(
+                        "Неверный формат ссылки. Убедитесь, что указан хост. "
+                        "Пример: 123.45.67.89:2053/api/"
+                    ),
+                ),
+                reply_markup=add_server_step_kb(current_step, total_params),
             )
             return
     else:
@@ -512,12 +550,6 @@ async def process_add_step(message: Message, state: FSMContext):
 
     await state.update_data(server_data=server_data)
     
-    # Delete a user's message (optional)
-    try:
-        await message.delete()
-    except:
-        pass
-    
     # Move to next step or confirmation
     if current_step < total_params:
         new_step = current_step + 1
@@ -526,21 +558,17 @@ async def process_add_step(message: Message, state: FSMContext):
         
         text = get_add_step_text(new_step, server_data, auth_method)
         
-        # Editing the previous bot message
-        # To do this, save message_id
-        await safe_edit_or_send(message,
+        await render_admin_dialog_from_input(message, state,
             text,
             reply_markup=add_server_step_kb(new_step, total_params),
-            force_new=True
         )
     else:
         # All data has been entered - check the connection
         await state.set_state(AdminStates.add_server_confirm)
         await state.update_data(add_step=total_params + 1, connection_test_passed=False)
         
-        await safe_edit_or_send(message,
+        target = await render_admin_dialog_from_input(message, state,
             "⏳ <b>Проверка подключения...</b>",
-            force_new=True
         )
         
         # Testing the connection
@@ -566,7 +594,7 @@ async def process_add_step(message: Message, state: FSMContext):
             text = "❌ <b>Не удалось подключиться к панели</b>"
             kb = add_server_test_failed_kb()
         
-        await safe_edit_or_send(message, text, reply_markup=kb, force_new=True)
+        await render_admin_dialog(target, state, text, reply_markup=kb)
 
 
 # Handlers for each add state
@@ -606,7 +634,7 @@ async def add_server_retest(callback: CallbackQuery, state: FSMContext):
     server_data = data.get('server_data', {})
     auth_method = data.get('auth_method', AUTH_LOGIN_PASSWORD)
     
-    await safe_edit_or_send(callback.message, 
+    target = await render_admin_dialog(callback.message, state,
         "⏳ <b>Проверка подключения...</b>"
     )
     
@@ -632,7 +660,7 @@ async def add_server_retest(callback: CallbackQuery, state: FSMContext):
         text = "❌ <b>Не удалось подключиться к панели</b>"
         kb = add_server_test_failed_kb()
     
-    await safe_edit_or_send(callback.message, text, reply_markup=kb)
+    await render_admin_dialog(target, state, text, reply_markup=kb)
     await callback.answer()
 
 
@@ -668,7 +696,7 @@ async def add_server_save(callback: CallbackQuery, state: FSMContext):
             panel_version=server_data.get('panel_version'),
         )
         
-        await safe_edit_or_send(callback.message, 
+        target = await render_admin_dialog(callback.message, state,
             f"✅ <b>Сервер успешно добавлен!</b>\n\n"
             f"🖥️ {escape_html(server_data['name'])}\n"
             f"🔗 <code>{escape_html(server_data.get('protocol', 'https'))}://"
@@ -681,11 +709,11 @@ async def add_server_save(callback: CallbackQuery, state: FSMContext):
         
         # Redirect to view the new server
         # Redirect to view the new server
-        await render_server_view(callback.message, server_id, state)
+        await render_server_view(target, server_id, state)
         
     except Exception as e:
         logger.error(f"Ошибка добавления сервера: {e}")
-        await safe_edit_or_send(callback.message, 
+        await render_admin_dialog(callback.message, state,
             f"❌ <b>Ошибка сохранения</b>\n\n<code>{escape_html(str(e))}</code>",
             reply_markup=back_and_home_kb("admin_servers")
         )

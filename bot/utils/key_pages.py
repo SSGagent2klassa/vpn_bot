@@ -115,30 +115,12 @@ def build_key_history_block(payments: Iterable[Mapping[str, Any]]) -> str:
                 ))
             continue
         tariff = payment.get('tariff_name') or '—'
-        ptype = payment.get('payment_type')
-        if int(payment.get('intent_version') or 0) == 1:
-            from bot.services.money import format_money_minor
+        from bot.services.money import format_money_minor
 
-            amount = format_money_minor(
-                payment.get('payable_amount_minor')
-                or payment.get('payable_amount_cents')
-                or 0,
-                payment.get('base_currency') or 'RUB',
-            )
-        elif ptype == 'stars':
-            stars = payment.get('final_amount_stars') if payment.get('final_amount_stars') is not None else payment.get('amount_stars') or 0
-            amount = f"{stars} ⭐"
-        elif ptype == 'crypto':
-            cents = payment.get('final_amount_cents') if payment.get('final_amount_cents') is not None else payment.get('amount_cents') or 0
-            amount_val = cents / 100
-            amount_str = f'{amount_val:g}'.replace('.', ',')
-            amount = f'${amount_str}'
-        elif ptype in ('cards', 'yookassa_qr', 'wata', 'platega', 'cardlink', 'balance', 'promo_free'):
-            rub = ((payment.get('final_amount_cents') or 0) / 100) if payment.get('final_amount_cents') is not None else payment.get('price_rub') or 0
-            rub_str = f'{rub:g}'.replace('.', ',')
-            amount = f'{rub_str} ₽'
-        else:
-            amount = '—'
+        amount = format_money_minor(
+            payment.get('payable_amount_minor') or 0,
+            payment.get('base_currency') or 'RUB',
+        )
         promo = (
             render_ui_text(
                 "key.history.promo_suffix",

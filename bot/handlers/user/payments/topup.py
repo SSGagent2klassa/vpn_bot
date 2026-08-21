@@ -143,11 +143,6 @@ def _parse_base_minor(value: str, currency: str | None = None) -> int | None:
     return parsed
 
 
-def _parse_rub_cents(value: str) -> int | None:
-    """Deprecated test/extension alias for explicit RUB input."""
-    return _parse_base_minor(value, 'RUB')
-
-
 def _balance_spending_enabled() -> bool:
     return is_referral_enabled() and get_referral_reward_type() == 'balance'
 

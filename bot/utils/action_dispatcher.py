@@ -9,6 +9,7 @@ from typing import Any
 
 from aiogram.types import CallbackQuery, Message
 
+from bot.utils.action_origin_context import ActionOriginContext
 from bot.utils.action_policy import (
     ACTION_POLICIES,
     normalize_core_action,
@@ -46,6 +47,7 @@ class CoreActionRequest:
     telegram_id: int
     source: str
     state: Any = None
+    origin_context: ActionOriginContext | None = None
 
 
 CoreActionExecutor = Callable[[CoreActionRequest], Any | Awaitable[Any]]
@@ -76,12 +78,18 @@ async def dispatch_core_action(
     *,
     source: str,
     state: Any = None,
+    origin_context: ActionOriginContext | None = None,
     _visited: tuple[str, ...] = (),
 ) -> bool:
     """Resolve policies and execute or redirect one semantic core action."""
     try:
         action_name = normalize_core_action(action)
         normalized_params = normalize_core_action_params(action_name, params)
+        if origin_context is not None:
+            if not isinstance(origin_context, ActionOriginContext):
+                raise ValueError('origin_context must be a validated ActionOriginContext')
+            if action_name != 'key.purchase.start':
+                raise ValueError('origin_context is supported only for key.purchase.start')
         telegram_id = _target_telegram_id(target)
         if telegram_id is None:
             raise ValueError('semantic action target has no Telegram user')
@@ -118,6 +126,7 @@ async def dispatch_core_action(
             telegram_id=telegram_id,
             source=source,
             state=state,
+            origin_context=origin_context,
         )
         try:
             result = executor(request)
@@ -146,10 +155,19 @@ async def dispatch_core_action(
             decision.get('params'),
             source=source,
             state=state,
+            origin_context=origin_context,
             _visited=(*_visited, action_name),
         )
     if target_kind == 'extension_action':
-        return await _redirect_to_extension_action(target, decision, extension_id)
+        return await _redirect_to_extension_action(
+            target,
+            decision,
+            extension_id,
+            source=source,
+            state=state,
+            origin_context=origin_context,
+            visited=(*_visited, action_name),
+        )
     if target_kind == 'page':
         return await _redirect_to_page(target, decision, extension_id, action_name)
     if target_kind == 'route':
@@ -234,6 +252,11 @@ async def _redirect_to_extension_action(
     target: CallbackQuery | Message,
     decision: Mapping[str, Any],
     extension_id: str,
+    *,
+    source: str,
+    state: Any,
+    origin_context: ActionOriginContext | None,
+    visited: tuple[str, ...],
 ) -> bool:
     from bot.utils.extension_callbacks import (
         EXTENSION_CALLBACK_HANDLERS,
@@ -259,16 +282,76 @@ async def _redirect_to_extension_action(
         },
         bot=getattr(target, 'bot', None),
     )
-    return await _apply_extension_result(target, result, extension_id, action_name, payload or '')
+    return await apply_extension_callback_result(
+        target,
+        result,
+        extension_id,
+        action_name,
+        payload or '',
+        source=source,
+        state=state,
+        origin_context=origin_context,
+        visited=visited,
+    )
 
 
-async def _apply_extension_result(
+async def apply_extension_callback_result(
     target: CallbackQuery | Message,
     result: Mapping[str, Any],
     extension_id: str,
     action_name: str,
     payload: str,
+    *,
+    source: str,
+    state: Any = None,
+    origin_context: ActionOriginContext | None = None,
+    visited: tuple[str, ...] = (),
 ) -> bool:
+    """Apply one normalized extension callback result through trusted adapters."""
+    if result.get('target') == 'core_action':
+        next_origin = origin_context
+        raw_origin = result.get('origin_context')
+        if raw_origin is not None:
+            from bot.utils.action_origin_context import normalize_public_origin_context
+            from bot.utils.extension_completion_registry import (
+                is_extension_completion_handler_registered,
+            )
+
+            try:
+                next_origin = normalize_public_origin_context(
+                    raw_origin,
+                    owner_extension_id=extension_id,
+                )
+                if (
+                    next_origin.completion_handler is not None
+                    and not is_extension_completion_handler_registered(
+                        next_origin.owner_extension_id,
+                        next_origin.completion_handler,
+                    )
+                ):
+                    raise ValueError('origin_context handler is not registered by its owner')
+            except Exception as exc:
+                logger.warning(
+                    "Rejected origin context from extension '%s' error_type=%s",
+                    extension_id,
+                    type(exc).__name__,
+                )
+                return await _redirect_to_page(
+                    target,
+                    {'page_key': 'action_unavailable', 'context': {}},
+                    extension_id,
+                    str(result.get('action') or ''),
+                )
+        return await dispatch_core_action(
+            target,
+            str(result.get('action') or ''),
+            result.get('params'),
+            source=source,
+            state=state,
+            origin_context=next_origin,
+            _visited=visited,
+        )
+
     from bot.utils.extension_rendering import render_extension_page, render_extension_route
 
     render_context = {
@@ -413,6 +496,7 @@ __all__ = [
     'CORE_ACTION_EXECUTORS',
     'MAX_ACTION_REDIRECT_DEPTH',
     'CoreActionRequest',
+    'apply_extension_callback_result',
     'apply_action_policy_previews',
     'dispatch_core_action',
     'register_core_action_executor',

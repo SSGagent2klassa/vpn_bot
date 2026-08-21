@@ -128,15 +128,6 @@ def _format_user_card(user: dict) -> tuple[str, any]:
         for currency, amount in sorted(base_totals.items()):
             if int(amount or 0) > 0:
                 lines.append(f'  💰 Сумма ({currency}): {format_money_minor(amount, currency)}')
-        legacy_usdt = int(payment_stats.get('total_amount_cents') or 0)
-        legacy_stars = int(payment_stats.get('total_amount_stars') or 0)
-        legacy_rub = float(payment_stats.get('total_amount_rub') or 0)
-        if legacy_usdt > 0:
-            lines.append(f'  💰 Старые платежи USDT: {format_money_minor(legacy_usdt, "USDT")}')
-        if legacy_stars > 0:
-            lines.append(f'  💰 Старые платежи Stars: {format_money_minor(legacy_stars, "XTR")}')
-        if legacy_rub > 0:
-            lines.append(f'  💰 Старые платежи RUB: {format_money_minor(round(legacy_rub * 100), "RUB")}')
         lines.append(f'  📅 Последняя оплата: {last_payment}')
     else:
         lines.append('  _Оплат не было_')

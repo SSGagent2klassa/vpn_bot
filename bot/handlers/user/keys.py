@@ -219,6 +219,23 @@ async def _execute_key_delete(request: CoreActionRequest) -> None:
     if key['is_active']:
         await _render_key_action_page(target, 'key_operation_unavailable', key=key)
         return
+    reconcile_host_ids: tuple[int, ...] = ()
+    try:
+        from bot.services.subscription_composition import (
+            list_key_subscription_reconcile_host_ids,
+        )
+
+        reconcile_host_ids = list_key_subscription_reconcile_host_ids(
+            key_id=key_id,
+            include_self=False,
+        )
+    except Exception as error:
+        logger.warning(
+            'Could not capture subscription reconcile targets before key '
+            'deletion key=%s type=%s',
+            key_id,
+            type(error).__name__,
+        )
     if (
         key.get('server_id')
         and is_managed_panel_email(key.get('panel_email'))
@@ -242,6 +259,22 @@ async def _execute_key_delete(request: CoreActionRequest) -> None:
         )
     success = delete_vpn_key(key_id)
     if success:
+        if reconcile_host_ids:
+            try:
+                from bot.services.subscription_composition import (
+                    schedule_subscription_host_reconciles,
+                )
+
+                schedule_subscription_host_reconciles(
+                    host_key_ids=reconcile_host_ids,
+                )
+            except Exception as error:
+                logger.warning(
+                    'Could not immediately schedule subscription cleanup after '
+                    'key deletion key=%s type=%s',
+                    key_id,
+                    type(error).__name__,
+                )
         await _render_key_action_page(target, 'my_keys_key_deleted', key=key)
     else:
         logger.error('Failed to delete VPN key %s from the database', key_id)
@@ -672,6 +705,19 @@ async def _key_replace_execute_locked(callback: CallbackQuery, state: FSMContext
         ):
             raise VPNAPIError('Не удалось сохранить новую привязку ключа')
         binding_swapped = True
+        try:
+            from bot.services.subscription_composition import (
+                schedule_key_subscription_reconciles,
+            )
+
+            schedule_key_subscription_reconciles(key_id=int(key_id))
+        except Exception as error:
+            logger.warning(
+                'Could not immediately schedule subscription composition after '
+                'key replacement key=%s type=%s',
+                key_id,
+                type(error).__name__,
+            )
 
         # === 5. Remove the old logical client only after the DB switch ===
         if (
@@ -730,6 +776,21 @@ async def _key_replace_execute_locked(callback: CallbackQuery, state: FSMContext
             },
         )
         await send_key_with_qr(delivery_target, updated_key, is_new=True)
+        try:
+            from bot.handlers.user.subscription_hosts import (
+                offer_default_subscription_host,
+            )
+
+            await offer_default_subscription_host(
+                callback,
+                component_key_id=int(key_id),
+                telegram_id=telegram_id,
+            )
+        except Exception:
+            logger.exception(
+                'Post-delivery subscription host flow failed after replacement key=%s',
+                key_id,
+            )
     except Exception as e:
         if candidate_client is not None and candidate_email and not binding_swapped:
             try:

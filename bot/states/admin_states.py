@@ -89,7 +89,7 @@ class AdminStates(StatesGroup):
     
     # ========== Adding a tariff (step-by-step dialogue) ==========
     add_tariff_name = State()        # Step 1: Title
-    add_tariff_price_rub = State()   # Step 2: Price in the current base currency
+    add_tariff_price = State()       # Step 2: Price in the current base currency
     add_tariff_duration = State()    # Step 3: Duration
     add_tariff_traffic_limit = State() # Step 4: Data Limit (GB)
     add_tariff_max_ips = State()     # Step 5: Device Limit (IP)
@@ -131,6 +131,7 @@ class AdminStates(StatesGroup):
     # ========== Management of tariff groups ==========
     group_add_name = State()         # Entering a new group name
     group_edit_name = State()        # Entering a new group name
+    group_subscription_parent = State()  # Selecting the subscription host group
     tariff_select_group = State()    # Selecting a group when adding a tariff
     server_select_group = State()    # Selecting a group when adding a server
 

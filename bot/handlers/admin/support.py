@@ -5,6 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from database.requests import (
+    SupportThreadClosedError,
     claim_support_thread,
     create_support_thread,
     get_support_thread,
@@ -19,6 +20,7 @@ from bot.services.support import (
     extract_support_payload,
     format_support_user_line,
     send_admin_message_to_user,
+    support_thread_operation,
     support_unsupported_text,
 )
 from bot.states.admin_states import AdminStates
@@ -29,6 +31,88 @@ from bot.utils.text import safe_edit_or_send
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+
+class _AdminSupportThreadState(RuntimeError):
+    def __init__(self, status: str):
+        super().__init__(status)
+        self.status = status
+
+
+async def _send_admin_support_message_locked(
+    message: Message,
+    *,
+    thread_id: int,
+    mode: str,
+    admin_id: int,
+    payload: dict,
+):
+    """Claims, delivers and records one admin reply under the thread lock."""
+    newly_claimed = False
+    async with support_thread_operation(thread_id):
+        thread = get_support_thread(thread_id)
+        if not thread:
+            raise _AdminSupportThreadState("not_found")
+        if thread.get("status") == "closed":
+            raise _AdminSupportThreadState("closed")
+
+        if mode == "reply":
+            claim_status = claim_support_thread(thread_id, admin_id)
+            if claim_status == "claimed":
+                newly_claimed = True
+            elif claim_status in {"assigned_other", "not_found", "closed"}:
+                raise _AdminSupportThreadState(claim_status)
+
+        try:
+            await send_admin_message_to_user(
+                message.bot,
+                thread=thread,
+                source_message=message,
+            )
+            record_support_message(
+                thread_id,
+                sender_type="admin",
+                sender_telegram_id=admin_id,
+                recipient_telegram_id=int(thread["user_telegram_id"]),
+                text_html=payload["text_html"],
+                media_type=payload["media_type"],
+                media_file_id=payload["media_file_id"],
+                source_chat_id=payload["source_chat_id"],
+                source_message_id=payload["source_message_id"],
+            )
+        except SupportThreadClosedError as exc:
+            raise _AdminSupportThreadState("closed") from exc
+        except Exception:
+            if newly_claimed:
+                release_support_thread_assignment(thread_id, admin_id)
+            raise
+    return thread, newly_claimed
+
+
+async def _show_admin_thread_state_error(
+    message: Message,
+    state: FSMContext,
+    status: str,
+) -> None:
+    if status == "assigned_other":
+        text = (
+            "⚠️ <b>Диалог уже в работе</b>\n\n"
+            "Другой администратор уже взял это обращение."
+        )
+    elif status == "closed":
+        text = (
+            "❌ <b>Диалог закрыт</b>\n\n"
+            "Закрытая тикет-сессия больше не принимает сообщения."
+        )
+    else:
+        text = "❌ <b>Диалог не найден</b>"
+    await safe_edit_or_send(
+        message,
+        text,
+        reply_markup=support_admin_home_kb(),
+        force_new=True,
+    )
+    await state.clear()
 
 
 @router.callback_query(F.data.startswith("admin_support_start:"))
@@ -87,6 +171,13 @@ async def admin_support_reply(callback: CallbackQuery, state: FSMContext):
     thread = get_support_thread(thread_id)
     if not thread:
         await callback.answer("❌ Диалог не найден", show_alert=True)
+        return
+
+    if thread.get("status") == "closed":
+        await callback.answer(
+            "❌ Диалог закрыт и больше не принимает сообщения",
+            show_alert=True,
+        )
         return
 
     assigned_admin_id = thread.get("assigned_admin_id")
@@ -193,30 +284,6 @@ async def process_admin_support_message(message: Message, state: FSMContext):
             await state.clear()
             return
 
-        claim_status = claim_support_thread(thread_id, admin_id)
-        if claim_status == "claimed":
-            newly_claimed = True
-        elif claim_status == "assigned_other":
-            await safe_edit_or_send(
-                message,
-                "⚠️ <b>Диалог уже в работе</b>\n\n"
-                "Другой администратор уже взял это обращение.",
-                reply_markup=support_admin_home_kb(),
-                force_new=True,
-            )
-            await state.clear()
-            return
-        elif claim_status == "not_found":
-            await safe_edit_or_send(
-                message,
-                "❌ <b>Диалог не найден</b>",
-                reply_markup=support_admin_home_kb(),
-                force_new=True,
-            )
-            await state.clear()
-            return
-
-        thread = get_support_thread(thread_id)
     else:
         await safe_edit_or_send(
             message,
@@ -227,15 +294,19 @@ async def process_admin_support_message(message: Message, state: FSMContext):
         await state.clear()
         return
 
+    thread_id = int(thread["id"])
     try:
-        await send_admin_message_to_user(
-            message.bot,
-            thread=thread,
-            source_message=message,
+        thread, newly_claimed = await _send_admin_support_message_locked(
+            message,
+            thread_id=thread_id,
+            mode=str(mode),
+            admin_id=admin_id,
+            payload=payload,
         )
+    except _AdminSupportThreadState as error:
+        await _show_admin_thread_state_error(message, state, error.status)
+        return
     except Exception as e:
-        if newly_claimed:
-            release_support_thread_assignment(int(thread["id"]), admin_id)
         if is_bot_blocked_error(e):
             mark_user_bot_blocked(int(thread["user_telegram_id"]))
             text = (
@@ -260,18 +331,6 @@ async def process_admin_support_message(message: Message, state: FSMContext):
         )
         await state.clear()
         return
-
-    record_support_message(
-        int(thread["id"]),
-        sender_type="admin",
-        sender_telegram_id=admin_id,
-        recipient_telegram_id=int(thread["user_telegram_id"]),
-        text_html=payload["text_html"],
-        media_type=payload["media_type"],
-        media_file_id=payload["media_file_id"],
-        source_chat_id=payload["source_chat_id"],
-        source_message_id=payload["source_message_id"],
-    )
 
     if newly_claimed:
         await cleanup_claimed_admin_notifications(

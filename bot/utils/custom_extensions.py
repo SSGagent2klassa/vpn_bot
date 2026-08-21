@@ -69,6 +69,7 @@ _PUBLIC_CUSTOM_EXTENSIONS_API = {
     'register_extension_settings',
     'register_guard',
     'register_key_lifecycle_hook',
+    'register_payment_completion_handler',
     'register_page_hook',
     'register_payment_provider',
     'register_pricing_policy',
@@ -101,6 +102,7 @@ _REGISTRATION_KINDS = (
     'promo_reward_policies',
     'referral_reward_policies',
     'key_lifecycle_hooks',
+    'completion_handlers',
     'payment_providers',
     'callback_handlers',
     'command_handlers',
@@ -113,6 +115,11 @@ _LAST_LOAD_RESULT = CustomExtensionsLoadResult(skipped=True, reason='not_loaded'
 _CURRENT_EXTENSION: ContextVar[str | None] = ContextVar('custom_extension_id', default=None)
 _CURRENT_EXTENSION_BOT: ContextVar[Any | None] = ContextVar('custom_extension_bot', default=None)
 _CURRENT_EXTENSION_TELEGRAM_ID: ContextVar[int | None] = ContextVar('custom_extension_telegram_id', default=None)
+_CURRENT_EXTENSION_INVOCATION_KIND: ContextVar[str | None] = ContextVar(
+    'custom_extension_invocation_kind',
+    default=None,
+)
+_EXTENSION_RUNTIME_BOT: Any | None = None
 _EXTENSION_REGISTRATIONS: dict[str, dict[str, set[str]]] = {}
 
 
@@ -120,7 +127,7 @@ def register_guard(name: str, func: Callable) -> None:
     """Registers page/route guard extensions."""
     _ensure_extension_mutation_allowed('register_guard')
     guard_name = _require_extension_registry_name(name, 'guard')
-    _register_page_guard(guard_name, _bind_extension_callable(func))
+    _register_page_guard(guard_name, _bind_extension_callable(func, invocation_kind='guard'))
     from bot.utils.page_flow import mark_page_flow_extension_owner
 
     extension_id = _CURRENT_EXTENSION.get()
@@ -141,7 +148,11 @@ def register_user_access_guard(name: str, func: Callable, *, replace: bool = Fal
 
     guard_name = _require_extension_registry_name(name, 'user access guard')
     _require_bool_option(replace, 'replace')
-    _register_user_access_guard(guard_name, _bind_extension_callable(func), replace=replace)
+    _register_user_access_guard(
+        guard_name,
+        _bind_extension_callable(func, invocation_kind='guard'),
+        replace=replace,
+    )
     _record_registration('user_access_guards', guard_name)
 
 
@@ -149,7 +160,7 @@ def register_page_hook(name: str, func: Callable) -> None:
     """Registers the extension's before-render hook."""
     _ensure_extension_mutation_allowed('register_page_hook')
     hook_name = _require_extension_registry_name(name, 'page hook')
-    _register_page_hook(hook_name, _bind_extension_callable(func))
+    _register_page_hook(hook_name, _bind_extension_callable(func, invocation_kind='page_hook'))
     from bot.utils.page_flow import mark_page_flow_extension_owner
 
     extension_id = _CURRENT_EXTENSION.get()
@@ -187,7 +198,7 @@ def register_callback_handler(
     action_key = register_extension_callback_handler(
         extension_id,
         action_name,
-        _bind_extension_callable(handler),
+        _bind_extension_callable(handler, invocation_kind='callback'),
         replace=replace,
         bypass_user_access_guard=bypass_user_access_guard,
     )
@@ -219,7 +230,7 @@ def register_command_handler(
         extension_id,
         command,
         description,
-        _bind_extension_callable(handler),
+        _bind_extension_callable(handler, invocation_kind='command'),
         replace=replace,
     )
     _record_registration('command_handlers', action_key)
@@ -248,7 +259,7 @@ def register_action_policy(
         extension_id,
         policy_name,
         actions=tuple(actions) if isinstance(actions, set) else actions,
-        handler=_bind_extension_callable(handler),
+        handler=_bind_extension_callable(handler, invocation_kind='action_policy'),
         replace=replace,
     )
     _record_registration('action_policies', policy_name)
@@ -261,7 +272,11 @@ def register_pricing_policy(name: str, func: Callable, *, replace: bool = False)
 
     policy_name = _require_extension_owned_registry_name(name, 'pricing policy')
     _require_bool_option(replace, 'replace')
-    _register_pricing_policy(policy_name, _bind_extension_callable(func), replace=replace)
+    _register_pricing_policy(
+        policy_name,
+        _bind_extension_callable(func, invocation_kind='policy'),
+        replace=replace,
+    )
     _record_registration('pricing_policies', policy_name)
 
 
@@ -272,7 +287,11 @@ def register_promo_reward_policy(name: str, func: Callable, *, replace: bool = F
 
     policy_name = _require_extension_owned_registry_name(name, 'promo reward policy')
     _require_bool_option(replace, 'replace')
-    _register_promo_reward_policy(policy_name, _bind_extension_callable(func), replace=replace)
+    _register_promo_reward_policy(
+        policy_name,
+        _bind_extension_callable(func, invocation_kind='policy'),
+        replace=replace,
+    )
     _record_registration('promo_reward_policies', policy_name)
 
 
@@ -283,7 +302,11 @@ def register_referral_reward_policy(name: str, func: Callable, *, replace: bool 
 
     policy_name = _require_extension_owned_registry_name(name, 'referral reward policy')
     _require_bool_option(replace, 'replace')
-    _register_referral_reward_policy(policy_name, _bind_extension_callable(func), replace=replace)
+    _register_referral_reward_policy(
+        policy_name,
+        _bind_extension_callable(func, invocation_kind='policy'),
+        replace=replace,
+    )
     _record_registration('referral_reward_policies', policy_name)
 
 
@@ -300,8 +323,37 @@ def register_key_lifecycle_hook(
 
     hook_name = _require_extension_owned_registry_name(name, 'key lifecycle hook')
     _require_bool_option(replace, 'replace')
-    _register_key_lifecycle_hook(hook_name, _bind_extension_callable(func), events=events, replace=replace)
+    _register_key_lifecycle_hook(
+        hook_name,
+        _bind_extension_callable(func, invocation_kind='lifecycle_hook'),
+        events=events,
+        replace=replace,
+    )
     _record_registration('key_lifecycle_hooks', hook_name)
+
+
+def register_payment_completion_handler(
+    name: str,
+    handler: Callable,
+    *,
+    replace: bool = False,
+) -> str:
+    """Register an extension-owned durable PaymentIntent completion handler."""
+    _ensure_extension_mutation_allowed('register_payment_completion_handler')
+    from bot.utils.extension_completion_registry import (
+        register_extension_completion_handler,
+    )
+
+    extension_id = _require_current_extension()
+    _require_bool_option(replace, 'replace')
+    key = register_extension_completion_handler(
+        extension_id,
+        name,
+        _bind_extension_callable(handler, invocation_kind='completion_handler'),
+        replace=replace,
+    )
+    _record_registration('completion_handlers', key)
+    return key
 
 
 def register_payment_provider(
@@ -330,16 +382,24 @@ def register_payment_provider(
     _require_bool_option(replace, 'replace')
     provider = _register_payment_provider(
         provider_key,
-        create_payment=_bind_extension_callable(create_payment),
-        check_payment=_bind_extension_callable(check_payment),
-        webhook_handler=_bind_extension_callable(webhook_handler) if webhook_handler is not None else None,
+        create_payment=_bind_extension_callable(create_payment, invocation_kind='payment_provider'),
+        check_payment=_bind_extension_callable(check_payment, invocation_kind='payment_provider'),
+        webhook_handler=(
+            _bind_extension_callable(webhook_handler, invocation_kind='payment_provider')
+            if webhook_handler is not None
+            else None
+        ),
         webhook_secret=webhook_secret,
         title=title,
         label=label,
         currency=currency,
         minimum_amount_minor=minimum_amount_minor,
         minimum_amount_cents=minimum_amount_cents,
-        is_enabled=_bind_extension_callable(is_enabled) if callable(is_enabled) else is_enabled,
+        is_enabled=(
+            _bind_extension_callable(is_enabled, invocation_kind='payment_provider')
+            if callable(is_enabled)
+            else is_enabled
+        ),
         auto_check_interval_seconds=auto_check_interval_seconds,
         supported_purposes=supported_purposes,
         metadata=metadata,
@@ -1343,7 +1403,7 @@ def _require_extension_payment_provider_id(provider_id: str) -> str:
     raise ValueError('provider_id расширения должен совпадать с namespace текущего расширения')
 
 
-def _bind_extension_callable(func: Callable) -> Callable:
+def _bind_extension_callable(func: Callable, *, invocation_kind: str) -> Callable:
     extension_id = _CURRENT_EXTENSION.get()
     if extension_id is None:
         return func
@@ -1352,6 +1412,7 @@ def _bind_extension_callable(func: Callable) -> Callable:
         @wraps(func)
         async def async_wrapper(*args, **kwargs):
             token = _CURRENT_EXTENSION.set(extension_id)
+            invocation_token = _CURRENT_EXTENSION_INVOCATION_KIND.set(invocation_kind)
             bot = _extract_extension_bot(args, kwargs)
             telegram_id = _extract_extension_telegram_id(args, kwargs)
             bot_token = _CURRENT_EXTENSION_BOT.set(bot) if bot is not None else None
@@ -1363,6 +1424,7 @@ def _bind_extension_callable(func: Callable) -> Callable:
                     _CURRENT_EXTENSION_TELEGRAM_ID.reset(telegram_token)
                 if bot_token is not None:
                     _CURRENT_EXTENSION_BOT.reset(bot_token)
+                _CURRENT_EXTENSION_INVOCATION_KIND.reset(invocation_token)
                 _CURRENT_EXTENSION.reset(token)
 
         return async_wrapper
@@ -1370,6 +1432,7 @@ def _bind_extension_callable(func: Callable) -> Callable:
     @wraps(func)
     def wrapper(*args, **kwargs):
         token = _CURRENT_EXTENSION.set(extension_id)
+        invocation_token = _CURRENT_EXTENSION_INVOCATION_KIND.set(invocation_kind)
         bot = _extract_extension_bot(args, kwargs)
         telegram_id = _extract_extension_telegram_id(args, kwargs)
         bot_token = _CURRENT_EXTENSION_BOT.set(bot) if bot is not None else None
@@ -1377,13 +1440,20 @@ def _bind_extension_callable(func: Callable) -> Callable:
         try:
             result = func(*args, **kwargs)
             if inspect.isawaitable(result):
-                return _await_with_extension_context(result, extension_id, bot=bot, telegram_id=telegram_id)
+                return _await_with_extension_context(
+                    result,
+                    extension_id,
+                    bot=bot,
+                    telegram_id=telegram_id,
+                    invocation_kind=invocation_kind,
+                )
             return result
         finally:
             if telegram_token is not None:
                 _CURRENT_EXTENSION_TELEGRAM_ID.reset(telegram_token)
             if bot_token is not None:
                 _CURRENT_EXTENSION_BOT.reset(bot_token)
+            _CURRENT_EXTENSION_INVOCATION_KIND.reset(invocation_token)
             _CURRENT_EXTENSION.reset(token)
 
     return wrapper
@@ -1395,8 +1465,10 @@ async def _await_with_extension_context(
     *,
     bot: Any = None,
     telegram_id: int | None = None,
+    invocation_kind: str | None = None,
 ) -> Any:
     token = _CURRENT_EXTENSION.set(extension_id)
+    invocation_token = _CURRENT_EXTENSION_INVOCATION_KIND.set(invocation_kind)
     bot_token = _CURRENT_EXTENSION_BOT.set(bot) if bot is not None else None
     telegram_token = _CURRENT_EXTENSION_TELEGRAM_ID.set(telegram_id) if telegram_id is not None else None
     try:
@@ -1406,6 +1478,7 @@ async def _await_with_extension_context(
             _CURRENT_EXTENSION_TELEGRAM_ID.reset(telegram_token)
         if bot_token is not None:
             _CURRENT_EXTENSION_BOT.reset(bot_token)
+        _CURRENT_EXTENSION_INVOCATION_KIND.reset(invocation_token)
         _CURRENT_EXTENSION.reset(token)
 
 
@@ -1423,11 +1496,22 @@ def _extension_bot_context(bot: Any):
 
 
 def _get_current_extension_bot() -> Any:
-    return _CURRENT_EXTENSION_BOT.get()
+    context_bot = _CURRENT_EXTENSION_BOT.get()
+    return context_bot if context_bot is not None else _EXTENSION_RUNTIME_BOT
+
+
+def _set_extension_runtime_bot(bot: Any | None) -> None:
+    """Binds the application bot for background extension lifecycle hooks."""
+    global _EXTENSION_RUNTIME_BOT
+    _EXTENSION_RUNTIME_BOT = bot
 
 
 def _get_current_extension_telegram_id() -> int | None:
     return _CURRENT_EXTENSION_TELEGRAM_ID.get()
+
+
+def _get_current_extension_invocation_kind() -> str | None:
+    return _CURRENT_EXTENSION_INVOCATION_KIND.get()
 
 
 def _extract_extension_bot(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
@@ -1548,6 +1632,7 @@ def _remove_extension_runtime_registrations(extension_id: str) -> None:
     from bot.utils.action_registry import ACTION_REGISTRY
     from bot.utils.extension_callbacks import remove_extension_callback_handlers
     from bot.utils.extension_commands import remove_extension_command_handlers
+    from bot.utils.extension_completion_registry import remove_extension_completion_handlers
     from bot.utils.extension_settings import remove_extension_settings
     from bot.utils.lifecycle_registry import KEY_LIFECYCLE_HOOKS
     from bot.utils.payment_provider_registry import PAYMENT_PROVIDERS
@@ -1573,6 +1658,10 @@ def _remove_extension_runtime_registrations(extension_id: str) -> None:
         REFERRAL_REWARD_POLICIES.pop(name, None)
     for name in registrations.get('key_lifecycle_hooks', set()):
         KEY_LIFECYCLE_HOOKS.pop(name, None)
+    remove_extension_completion_handlers(
+        extension_id,
+        registrations.get('completion_handlers', set()),
+    )
     for name in registrations.get('payment_providers', set()):
         PAYMENT_PROVIDERS.pop(name, None)
     remove_extension_callback_handlers(extension_id, registrations.get('callback_handlers', set()))
@@ -1588,6 +1677,7 @@ def _snapshot_runtime_registries() -> dict[str, Any]:
     from bot.utils.action_registry import ACTION_REGISTRY
     from bot.utils.extension_callbacks import EXTENSION_ACCESS_CHECK_CALLBACKS, EXTENSION_CALLBACK_HANDLERS
     from bot.utils.extension_commands import EXTENSION_COMMAND_DEFINITIONS, EXTENSION_COMMAND_HANDLERS
+    from bot.utils.extension_completion_registry import EXTENSION_COMPLETION_HANDLERS
     from bot.utils.extension_settings import EXTENSION_SETTINGS
     from bot.utils.lifecycle_registry import KEY_LIFECYCLE_HOOKS
     from bot.utils.payment_provider_registry import PAYMENT_PROVIDERS
@@ -1611,6 +1701,7 @@ def _snapshot_runtime_registries() -> dict[str, Any]:
         'promo_reward_policies': dict(PROMO_REWARD_POLICIES),
         'referral_reward_policies': dict(REFERRAL_REWARD_POLICIES),
         'key_lifecycle_hooks': dict(KEY_LIFECYCLE_HOOKS),
+        'completion_handlers': dict(EXTENSION_COMPLETION_HANDLERS),
         'payment_providers': dict(PAYMENT_PROVIDERS),
         'callback_handlers': dict(EXTENSION_CALLBACK_HANDLERS),
         'access_check_callbacks': set(EXTENSION_ACCESS_CHECK_CALLBACKS),
@@ -1630,6 +1721,7 @@ def _restore_runtime_registries(snapshot: dict[str, Any]) -> None:
     from bot.utils.action_registry import ACTION_REGISTRY
     from bot.utils.extension_callbacks import EXTENSION_ACCESS_CHECK_CALLBACKS, EXTENSION_CALLBACK_HANDLERS
     from bot.utils.extension_commands import EXTENSION_COMMAND_DEFINITIONS, EXTENSION_COMMAND_HANDLERS
+    from bot.utils.extension_completion_registry import EXTENSION_COMPLETION_HANDLERS
     from bot.utils.extension_settings import EXTENSION_SETTINGS
     from bot.utils.lifecycle_registry import KEY_LIFECYCLE_HOOKS
     from bot.utils.payment_provider_registry import PAYMENT_PROVIDERS
@@ -1657,6 +1749,8 @@ def _restore_runtime_registries(snapshot: dict[str, Any]) -> None:
     REFERRAL_REWARD_POLICIES.update(snapshot['referral_reward_policies'])
     KEY_LIFECYCLE_HOOKS.clear()
     KEY_LIFECYCLE_HOOKS.update(snapshot['key_lifecycle_hooks'])
+    EXTENSION_COMPLETION_HANDLERS.clear()
+    EXTENSION_COMPLETION_HANDLERS.update(snapshot.get('completion_handlers', {}))
     PAYMENT_PROVIDERS.clear()
     PAYMENT_PROVIDERS.update(snapshot['payment_providers'])
     EXTENSION_CALLBACK_HANDLERS.clear()
@@ -1679,6 +1773,7 @@ def _registry_totals() -> dict[str, int]:
     from bot.utils.action_registry import ACTION_REGISTRY
     from bot.utils.extension_callbacks import EXTENSION_CALLBACK_HANDLERS
     from bot.utils.extension_commands import EXTENSION_COMMAND_DEFINITIONS
+    from bot.utils.extension_completion_registry import EXTENSION_COMPLETION_HANDLERS
     from bot.utils.extension_settings import EXTENSION_SETTINGS
     from bot.utils.lifecycle_registry import KEY_LIFECYCLE_HOOKS
     from bot.utils.payment_provider_registry import PAYMENT_PROVIDERS
@@ -1698,6 +1793,7 @@ def _registry_totals() -> dict[str, int]:
         'promo_reward_policies': len(PROMO_REWARD_POLICIES),
         'referral_reward_policies': len(REFERRAL_REWARD_POLICIES),
         'key_lifecycle_hooks': len(KEY_LIFECYCLE_HOOKS),
+        'completion_handlers': len(EXTENSION_COMPLETION_HANDLERS),
         'payment_providers': len(PAYMENT_PROVIDERS),
         'callback_handlers': len(EXTENSION_CALLBACK_HANDLERS),
         'command_handlers': len(EXTENSION_COMMAND_DEFINITIONS),
@@ -1749,6 +1845,7 @@ __all__ = [
     'register_extension_settings',
     'register_guard',
     'register_key_lifecycle_hook',
+    'register_payment_completion_handler',
     'register_page_hook',
     'register_payment_provider',
     'register_pricing_policy',

@@ -6,9 +6,14 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from bot.utils.action_origin_context import (
+    ActionOriginContext,
+    normalize_stored_origin_context,
+)
 from database.requests import (
     cancel_promo_reservation_for_order,
     cancel_unconfirmed_payment_for_method_change,
+    confirm_internal_payment_intent_settlement,
     create_payment_intent_record,
     get_base_currency,
     get_page,
@@ -72,6 +77,7 @@ class PaymentIntent:
     charge_currency: str | None = None
     rate_snapshot: Mapping[str, Any] = field(default_factory=dict)
     provider_confirmed_at: str | None = None
+    origin_context: ActionOriginContext | None = None
 
     @property
     def nominal_amount_cents(self) -> int:
@@ -171,11 +177,20 @@ def create_payment_intent(
     nominal_amount_cents: int | None = None,
     description: str | None = None,
     navigation: PaymentNavigation | None = None,
+    origin_context: ActionOriginContext | Mapping[str, Any] | None = None,
+    origin_context_token: str | None = None,
 ) -> PaymentIntent:
     """Validates and creates a core purpose before a provider is selected."""
     definition = _purpose_definition(purpose)
     payload = dict(purpose_data or {})
     _validate_purpose_payload(definition, payload)
+    if origin_context is not None and origin_context_token is not None:
+        raise ValueError('pass origin_context or origin_context_token, not both')
+    normalized_origin = normalize_stored_origin_context(origin_context)
+    if (normalized_origin is not None or origin_context_token is not None) and (
+        purpose != PURPOSE_KEY_PURCHASE
+    ):
+        raise ValueError('origin_context is supported only for key_purchase')
 
     tariff = None
     tariff_id = _optional_positive_int(payload.get('tariff_id'))
@@ -256,6 +271,12 @@ def create_payment_intent(
         tariff_id=tariff_id,
         vpn_key_id=key_id,
         period_days=int(tariff.get('duration_days') or 0) if tariff else None,
+        origin_context=(
+            normalized_origin.as_storage_dict()
+            if normalized_origin is not None
+            else None
+        ),
+        origin_context_token=origin_context_token,
     )
     intent = load_payment_intent(order_id)
     if intent is None:
@@ -289,7 +310,6 @@ def quote_payment_intent(order_id: str, payment_type: str) -> PaymentQuote:
         action=intent.purpose,
         purpose=intent.purpose,
         nominal_amount_minor=intent.nominal_amount_minor,
-        nominal_amount_cents=intent.nominal_amount_minor,
         rate_snapshot=dict(intent.rate_snapshot) or None,
     )
     if not pricing.get('ok'):
@@ -298,7 +318,7 @@ def quote_payment_intent(order_id: str, payment_type: str) -> PaymentQuote:
     if intent.balance_deduct_minor > 0 and intent.purpose != PURPOSE_BALANCE_TOPUP:
         external_payable = max(
             0,
-            int(pricing.get('payable_amount_minor', pricing['payable_amount_cents']))
+            int(pricing['payable_amount_minor'])
             - intent.balance_deduct_minor,
         )
         provider_amount, charge_currency = provider_amount_from_base_minor(
@@ -315,28 +335,14 @@ def quote_payment_intent(order_id: str, payment_type: str) -> PaymentQuote:
         int(pricing['final_amount']),
         str(pricing['charge_currency']),
     )
-    compatibility_cents = (
-        int(pricing['final_amount'])
-        if str(pricing['charge_currency']) != 'XTR'
-        else 0
-    )
-    compatibility_stars = (
-        int(pricing['final_amount'])
-        if str(pricing['charge_currency']) == 'XTR'
-        else 0
-    )
     try:
         quote_persisted = update_payment_intent_quote(
             intent.order_id,
             payment_type=str(payment_type),
-            payable_amount_minor=int(
-                pricing.get('payable_amount_minor', pricing['payable_amount_cents'])
-            ),
+            payable_amount_minor=int(pricing['payable_amount_minor']),
             charge_amount=_decimal_text(charge_amount),
             charge_currency=str(pricing['charge_currency']),
             rate_snapshot=pricing['rate_snapshot'],
-            compatibility_amount_cents=compatibility_cents,
-            compatibility_amount_stars=compatibility_stars,
         )
     except Exception:
         cancel_promo_reservation_for_order(intent.order_id)
@@ -347,8 +353,24 @@ def quote_payment_intent(order_id: str, payment_type: str) -> PaymentQuote:
     return _payment_quote(intent, pricing, charge_amount=charge_amount)
 
 
+def confirm_internal_payment_settlement(
+    order_id: str,
+    *,
+    payment_type: str,
+    balance_deduct_minor: int | None = None,
+    rate_snapshot: Mapping[str, Any] | None = None,
+) -> bool:
+    """Persist trusted free/full-balance settlement before fulfillment starts."""
+    return confirm_internal_payment_intent_settlement(
+        str(order_id),
+        payment_type=str(payment_type),
+        balance_deduct_minor=balance_deduct_minor,
+        rate_snapshot=rate_snapshot,
+    )
+
+
 def load_payment_intent(order_id: str) -> PaymentIntent | None:
-    """Loads only v1 intents; legacy payments remain compatibility records."""
+    """Load only v1 intents; historical non-v1 rows are audit-only."""
     row = get_payment_intent(str(order_id))
     if not row or int(row.get('intent_version') or 0) != 1:
         return None
@@ -379,6 +401,7 @@ def load_payment_intent(order_id: str) -> PaymentIntent | None:
             if row.get('provider_confirmed_at')
             else None
         ),
+        origin_context=normalize_stored_origin_context(row.get('origin_context')),
     )
 
 
@@ -424,6 +447,7 @@ def restart_payment_intent_for_method_change(
             nominal_amount_minor=nominal_amount,
             description=description,
             navigation=navigation,
+            origin_context=current.origin_context,
         )
     except ValueError:
         return None
@@ -499,11 +523,6 @@ def format_base_minor(amount_minor: int, currency: str | None = None) -> str:
     return format_money_minor(amount_minor, currency or get_base_currency())
 
 
-def format_rub_cents(amount_cents: int) -> str:
-    """Deprecated formatter kept for old RUB-only callers."""
-    return format_money_minor(amount_cents, 'RUB')
-
-
 def _purpose_definition(purpose: str) -> PaymentPurposeDefinition:
     definition = PURPOSE_REGISTRY.get(str(purpose))
     if definition is None:
@@ -537,16 +556,8 @@ def _payment_quote(
         order_id=intent.order_id,
         payment_type=str(pricing.get('payment_type') or ''),
         base_currency=intent.base_currency,
-        nominal_amount_minor=int(
-            pricing.get('nominal_amount_minor')
-            or pricing.get('nominal_amount_cents')
-            or intent.nominal_amount_minor
-        ),
-        payable_amount_minor=int(
-            pricing.get('payable_amount_minor')
-            or pricing.get('payable_amount_cents')
-            or 0
-        ),
+        nominal_amount_minor=int(pricing['nominal_amount_minor']),
+        payable_amount_minor=int(pricing['payable_amount_minor']),
         charge_amount=charge_amount or _provider_charge_decimal(provider_amount, currency),
         charge_currency=currency,
         rate_snapshot=MappingProxyType(dict(pricing.get('rate_snapshot') or {})),
@@ -606,10 +617,10 @@ __all__ = [
     'PaymentQuote',
     'PaymentResult',
     'PaymentTarget',
+    'confirm_internal_payment_settlement',
     'create_payment_intent',
     'default_payment_navigation',
     'format_base_minor',
-    'format_rub_cents',
     'load_payment_intent',
     'quote_payment_intent',
     'restart_payment_intent_for_method_change',

@@ -152,8 +152,6 @@ def set_currency_rate(
                 """,
                 (legacy_key, legacy_value),
             )
-        if target == 'RUB':
-            _refresh_legacy_tariff_rub_prices(conn, base, rate)
     return normalized
 
 
@@ -224,7 +222,6 @@ def preview_base_currency_switch(
         'cancelable_intents': int(cancelable['row_count'] or 0),
         'blocking_intents': int(blocking['row_count'] or 0),
     }
-
 
 def execute_base_currency_switch_record(
     *,
@@ -373,9 +370,6 @@ def execute_base_currency_switch_record(
             """,
             (target,),
         )
-        rub_rate = Decimal('1') if target == 'RUB' else new_rates.get('RUB')
-        if rub_rate is not None:
-            _refresh_legacy_tariff_rub_prices(conn, target, rub_rate)
         if target == 'RUB':
             for quote_currency, legacy_key in (
                 ('USDT', 'stablecoin_rub_rate'),
@@ -422,19 +416,3 @@ def execute_base_currency_switch_record(
         'canceled_intents': len(canceled_order_ids),
         'backup_path': str(backup_path),
     }
-
-
-def _refresh_legacy_tariff_rub_prices(
-    conn: Any,
-    base_currency: str,
-    rub_units_per_base: Decimal,
-) -> None:
-    """Keeps the deprecated price_rub column usable by legacy provider handlers."""
-    rows = conn.execute("SELECT id, price_minor FROM tariffs").fetchall()
-    for row in rows:
-        base_major = Decimal(int(row['price_minor'] or 0)) / Decimal('100')
-        rub_major = base_major if base_currency == 'RUB' else base_major * rub_units_per_base
-        conn.execute(
-            "UPDATE tariffs SET price_rub = ? WHERE id = ?",
-            (_decimal_text(rub_major), int(row['id'])),
-        )

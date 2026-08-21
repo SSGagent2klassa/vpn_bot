@@ -162,7 +162,8 @@ def get_open_payment_provider_orders(limit: int = 50) -> list[dict[str, Any]]:
             SELECT ppo.*
             FROM payment_provider_orders ppo
             JOIN payments p ON p.order_id = ppo.order_id
-            WHERE p.status = 'pending'
+            WHERE p.intent_version = 1
+              AND p.status = 'pending'
               AND ppo.status IN ('pending', 'succeeded')
             ORDER BY
               CASE ppo.status WHEN 'succeeded' THEN 0 ELSE 1 END,
@@ -188,6 +189,7 @@ def list_pending_payment_provider_orders(provider_id: str) -> list[dict[str, Any
             FROM payment_provider_orders ppo
             JOIN payments p ON p.order_id = ppo.order_id
             WHERE ppo.provider_id = ?
+              AND p.intent_version = 1
               AND ppo.status = 'pending'
               AND p.status = 'pending'
               AND p.provider_confirmed_at IS NULL
@@ -252,35 +254,24 @@ def update_payment_provider_order_status(
             """,
             (normalized_status, provider_payment_id, payment_url, metadata_json, order_id),
         )
-        payment_columns = {
-            str(row['name'])
-            for row in conn.execute("PRAGMA table_info(payments)").fetchall()
-        }
-        if normalized_status == 'succeeded' and {
-            'intent_version',
-            'provider_confirmed_at',
-            'fulfillment_status',
-            'fulfillment_last_error',
-        }.issubset(payment_columns):
+        if normalized_status == 'succeeded':
             conn.execute(
                 """
                 UPDATE payments
                 SET provider_confirmed_at = COALESCE(provider_confirmed_at, CURRENT_TIMESTAMP),
                     fulfillment_status = CASE
-                        WHEN intent_version = 1
-                         AND status = 'pending'
+                        WHEN status = 'pending'
                          AND fulfillment_status IN ('pending', 'failed', 'provider_succeeded')
                             THEN 'provider_succeeded'
                         ELSE fulfillment_status
                     END,
                     fulfillment_last_error = CASE
-                        WHEN intent_version = 1
-                         AND status = 'pending'
+                        WHEN status = 'pending'
                          AND fulfillment_status IN ('pending', 'failed', 'provider_succeeded')
                             THEN NULL
                         ELSE fulfillment_last_error
                     END
-                WHERE order_id = ?
+                WHERE order_id = ? AND intent_version = 1
                 """,
                 (order_id,),
             )

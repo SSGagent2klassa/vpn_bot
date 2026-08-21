@@ -22,6 +22,11 @@ from database.requests import (
 
 async def check_custom_payment_order(provider_id: str, order: Mapping[str, Any]) -> dict[str, Any]:
     """Checks the external status of a custom payment and updates the provider-order."""
+    if int(order.get('intent_version') or 0) != 1:
+        raise ValueError('custom payment checks require Payment Intent v1')
+    purpose = str(order.get('purpose') or '')
+    if purpose not in {'key_purchase', 'key_renewal', 'balance_topup'}:
+        raise ValueError('custom payment purpose is invalid')
     provider = get_payment_provider(provider_id)
     if provider is None:
         raise ValueError('payment provider не зарегистрирован')
@@ -29,6 +34,17 @@ async def check_custom_payment_order(provider_id: str, order: Mapping[str, Any])
     provider_order = get_payment_provider_order(str(order.get('order_id') or ''))
     if not provider_order or provider_order.get('provider_id') != provider.provider_id:
         raise ValueError('payment provider order не найден')
+
+    charge_currency = str(order.get('charge_currency') or provider.currency)
+    from bot.services.money import parse_major_to_minor
+
+    try:
+        provider_amount_minor = parse_major_to_minor(
+            order.get('charge_amount') or '0',
+            charge_currency,
+        )
+    except (TypeError, ValueError):
+        provider_amount_minor = 0
 
     result = await check_payment(
         provider.provider_id,
@@ -40,16 +56,16 @@ async def check_custom_payment_order(provider_id: str, order: Mapping[str, Any])
             'order_id': order.get('order_id'),
             'provider_payment_id': provider_order.get('provider_payment_id'),
             'payment_url': provider_order.get('payment_url'),
-            'amount_cents': order.get('final_amount_cents') if order.get('final_amount_cents') is not None else order.get('amount_cents'),
-            'currency': order.get('charge_currency') or provider.currency,
-            'purpose': order.get('purpose') or ('key_renewal' if order.get('vpn_key_id') else 'key_purchase'),
+            'amount_cents': provider_amount_minor,
+            'currency': charge_currency,
+            'purpose': purpose,
             'base_currency': order.get('base_currency') or 'RUB',
-            'nominal_amount_minor': order.get('nominal_amount_minor') or order.get('nominal_amount_cents') or 0,
-            'payable_amount_minor': order.get('payable_amount_minor') or order.get('payable_amount_cents') or order.get('final_amount_cents') or 0,
-            'nominal_amount_cents': order.get('nominal_amount_minor') or order.get('nominal_amount_cents') or 0,
-            'payable_amount_cents': order.get('payable_amount_minor') or order.get('payable_amount_cents') or order.get('final_amount_cents') or 0,
+            'nominal_amount_minor': order.get('nominal_amount_minor') or 0,
+            'payable_amount_minor': order.get('payable_amount_minor') or 0,
+            'nominal_amount_cents': order.get('nominal_amount_minor') or 0,
+            'payable_amount_cents': order.get('payable_amount_minor') or 0,
             'charge_amount': order.get('charge_amount'),
-            'charge_currency': order.get('charge_currency') or provider.currency,
+            'charge_currency': charge_currency,
             'description': order.get('description') or '',
             'rate_snapshot': order.get('rate_snapshot') or {},
         },
@@ -80,17 +96,6 @@ async def complete_custom_payment_order(
         notify_user=notify_user,
     )
     return result.as_dict()
-
-
-async def auto_check_custom_payment_orders(
-    *,
-    bot: Any = None,
-    limit: int = 50,
-) -> dict[str, int]:
-    """Compatibility wrapper for the shared bounded payment polling queue."""
-    from bot.services.payment_auto_check import auto_check_payment_orders
-
-    return await auto_check_payment_orders(bot=bot, limit=min(int(limit), 10))
 
 
 async def process_custom_payment_webhook(
@@ -128,7 +133,7 @@ async def process_custom_payment_webhook(
 
     order_id = str(provider_order.get('order_id') or '')
     order = find_order_by_order_id(order_id)
-    if not order:
+    if not order or int(order.get('intent_version') or 0) != 1:
         return {'ok': False, 'reason': 'order_not_found', 'http_status': 404}
 
     status = str(webhook_result['status'])
@@ -184,7 +189,6 @@ def _find_provider_order_for_webhook(
 
 
 __all__ = [
-    'auto_check_custom_payment_orders',
     'check_custom_payment_order',
     'complete_custom_payment_order',
     'process_custom_payment_webhook',

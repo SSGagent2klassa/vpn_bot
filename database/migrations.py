@@ -2,7 +2,7 @@
 
 Fresh installations are created directly at the committed v97 compatibility
 boundary. Older databases must pass through the ordered blocking releases that
-materialize v97 before this code can run. Migrations v98-v99 remain incremental
+materialize v97 before this code can run. Migrations v98-v103 remain incremental
 so already installed v97 databases and fresh databases use the same transitions.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 INITIAL_VERSION = 97
 
 # Current schema version; post-v97 changes stay outside the compressed baseline.
-LATEST_VERSION = 99
+LATEST_VERSION = 103
 
 
 DEFAULT_BROADCAST_STYLE_PROFILE = {
@@ -2172,9 +2172,1028 @@ def migration_99(conn: sqlite3.Connection) -> None:
     )
 
 
+def _rebuild_support_messages_for_v100(conn: sqlite3.Connection) -> None:
+    """Allow extension-origin support messages without a Telegram source."""
+    conn.execute("DROP TABLE IF EXISTS support_messages_v100")
+    conn.execute(
+        """
+        CREATE TABLE support_messages_v100 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id INTEGER NOT NULL,
+            sender_type TEXT NOT NULL CHECK (sender_type IN ('user', 'admin')),
+            sender_telegram_id INTEGER,
+            recipient_telegram_id INTEGER,
+            text_html TEXT NOT NULL DEFAULT '',
+            media_type TEXT,
+            media_file_id TEXT,
+            source_chat_id INTEGER,
+            source_message_id INTEGER,
+            origin_type TEXT NOT NULL DEFAULT 'telegram'
+                CHECK (origin_type IN ('telegram', 'extension')),
+            origin_extension_id TEXT,
+            origin_operation_key TEXT,
+            delivered_message_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CHECK (
+                (
+                    origin_type = 'telegram'
+                    AND sender_telegram_id IS NOT NULL
+                    AND source_chat_id IS NOT NULL
+                    AND source_message_id IS NOT NULL
+                    AND origin_extension_id IS NULL
+                    AND origin_operation_key IS NULL
+                )
+                OR (
+                    origin_type = 'extension'
+                    AND origin_extension_id IS NOT NULL
+                    AND LENGTH(TRIM(origin_extension_id)) > 0
+                    AND origin_operation_key IS NOT NULL
+                    AND LENGTH(TRIM(origin_operation_key)) > 0
+                )
+            ),
+            FOREIGN KEY (thread_id) REFERENCES support_threads(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO support_messages_v100 (
+            id, thread_id, sender_type, sender_telegram_id,
+            recipient_telegram_id, text_html, media_type, media_file_id,
+            source_chat_id, source_message_id, origin_type,
+            origin_extension_id, origin_operation_key,
+            delivered_message_id, created_at
+        )
+        SELECT
+            id, thread_id, sender_type, sender_telegram_id,
+            recipient_telegram_id, text_html, media_type, media_file_id,
+            source_chat_id, source_message_id, 'telegram',
+            NULL, NULL, NULL, created_at
+        FROM support_messages
+        """
+    )
+    conn.execute("DROP TABLE support_messages")
+    conn.execute("ALTER TABLE support_messages_v100 RENAME TO support_messages")
+
+
+def migration_100(conn: sqlite3.Connection) -> None:
+    """Migration v100: extension Core facade debit and support operations."""
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        support_columns = _table_columns(conn, 'support_messages')
+        if 'origin_type' not in support_columns:
+            _rebuild_support_messages_for_v100(conn)
+
+        operation_columns = _table_columns(conn, 'extension_core_operations')
+        if 'request_fingerprint' not in operation_columns:
+            conn.execute(
+                "ALTER TABLE extension_core_operations "
+                "ADD COLUMN request_fingerprint TEXT"
+            )
+
+        notification_columns = _table_columns(conn, 'support_admin_notifications')
+        if 'support_message_id' not in notification_columns:
+            conn.execute(
+                "ALTER TABLE support_admin_notifications "
+                "ADD COLUMN support_message_id INTEGER "
+                "REFERENCES support_messages(id) ON DELETE CASCADE"
+            )
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_support_messages_thread "
+            "ON support_messages(thread_id, created_at)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_support_messages_extension_operation "
+            "ON support_messages(origin_extension_id, origin_operation_key) "
+            "WHERE origin_type = 'extension'"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_support_admin_notifications_generated "
+            "ON support_admin_notifications(support_message_id, admin_telegram_id) "
+            "WHERE support_message_id IS NOT NULL"
+        )
+
+        foreign_key_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_errors:
+            raise RuntimeError(
+                "foreign_key_check failed after support extension migration: "
+                f"{foreign_key_errors[:5]}"
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+    logger.info(
+        "Migration v100 applied: extension operation fingerprints and "
+        "generated support message provenance enabled"
+    )
+
+
+def migration_101(conn: sqlite3.Connection) -> None:
+    """Migration v101: key subscription composition and durable action origins."""
+    group_columns = _table_columns(conn, 'tariff_groups')
+    if 'subscription_parent_group_id' not in group_columns:
+        conn.execute(
+            "ALTER TABLE tariff_groups "
+            "ADD COLUMN subscription_parent_group_id INTEGER "
+            "REFERENCES tariff_groups(id) ON DELETE SET NULL"
+        )
+
+    payment_columns = _table_columns(conn, 'payments')
+    payment_origin_columns = {
+        'origin_extension_id': 'TEXT',
+        'origin_context_version': 'INTEGER',
+        'origin_context_json': "TEXT NOT NULL DEFAULT '{}'",
+        'origin_workflow_id': 'TEXT',
+        'origin_completion_handler': 'TEXT',
+    }
+    for column_name, declaration in payment_origin_columns.items():
+        if column_name not in payment_columns:
+            conn.execute(
+                f"ALTER TABLE payments ADD COLUMN {column_name} {declaration}"
+            )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscription_bindings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            host_key_id INTEGER NOT NULL
+                REFERENCES vpn_keys(id) ON DELETE CASCADE,
+            component_key_id INTEGER NOT NULL
+                REFERENCES vpn_keys(id) ON DELETE CASCADE,
+            source_namespace TEXT NOT NULL DEFAULT 'core',
+            source_reference TEXT,
+            managed_token TEXT NOT NULL UNIQUE,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(host_key_id, component_key_id),
+            CHECK(host_key_id <> component_key_id),
+            CHECK(LENGTH(TRIM(source_namespace)) > 0),
+            CHECK(LENGTH(TRIM(managed_token)) > 0)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_subscription_bindings_component
+        ON subscription_bindings(component_key_id, host_key_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscription_composition_sync (
+            host_key_id INTEGER PRIMARY KEY
+                REFERENCES vpn_keys(id) ON DELETE CASCADE,
+            state TEXT NOT NULL DEFAULT 'pending'
+                CHECK(state IN ('pending', 'synced', 'retrying', 'blocked')),
+            desired_revision INTEGER NOT NULL DEFAULT 0,
+            applied_revision INTEGER NOT NULL DEFAULT 0,
+            applied_tokens_json TEXT NOT NULL DEFAULT '[]',
+            applied_host_fingerprint TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TIMESTAMP,
+            lease_until TIMESTAMP,
+            lease_owner_token TEXT,
+            last_attempt_at TIMESTAMP,
+            last_error_code TEXT,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK(desired_revision >= 0),
+            CHECK(applied_revision >= 0),
+            CHECK(attempts >= 0)
+        )
+        """
+    )
+    sync_columns = _table_columns(conn, 'subscription_composition_sync')
+    if 'lease_owner_token' not in sync_columns:
+        conn.execute(
+            "ALTER TABLE subscription_composition_sync "
+            "ADD COLUMN lease_owner_token TEXT"
+        )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_subscription_composition_sync_due
+        ON subscription_composition_sync(state, next_attempt_at, lease_until)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS subscription_bindings_after_insert
+        AFTER INSERT ON subscription_bindings
+        BEGIN
+            INSERT INTO subscription_composition_sync (
+                host_key_id, state, desired_revision, applied_revision,
+                applied_tokens_json, attempts, next_attempt_at, lease_until,
+                last_error_code, updated_at
+            ) VALUES (
+                NEW.host_key_id, 'pending', 1, 0, '[]', 0, NULL, NULL,
+                NULL, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT(host_key_id) DO UPDATE SET
+                state = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN state
+                    ELSE 'pending'
+                END,
+                desired_revision = desired_revision + 1,
+                attempts = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN attempts
+                    ELSE 0
+                END,
+                next_attempt_at = NULL,
+                lease_until = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN lease_until
+                    ELSE NULL
+                END,
+                lease_owner_token = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN lease_owner_token
+                    ELSE NULL
+                END,
+                last_error_code = NULL,
+                updated_at = CURRENT_TIMESTAMP;
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS subscription_bindings_after_delete
+        AFTER DELETE ON subscription_bindings
+        WHEN EXISTS (SELECT 1 FROM vpn_keys WHERE id = OLD.host_key_id)
+        BEGIN
+            INSERT INTO subscription_composition_sync (
+                host_key_id, state, desired_revision, applied_revision,
+                applied_tokens_json, attempts, next_attempt_at, lease_until,
+                last_error_code, updated_at
+            ) VALUES (
+                OLD.host_key_id, 'pending', 1, 0, '[]', 0, NULL, NULL,
+                NULL, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT(host_key_id) DO UPDATE SET
+                state = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN state
+                    ELSE 'pending'
+                END,
+                desired_revision = desired_revision + 1,
+                attempts = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN attempts
+                    ELSE 0
+                END,
+                next_attempt_at = NULL,
+                lease_until = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN lease_until
+                    ELSE NULL
+                END,
+                lease_owner_token = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN lease_owner_token
+                    ELSE NULL
+                END,
+                last_error_code = NULL,
+                updated_at = CURRENT_TIMESTAMP;
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS vpn_keys_subscription_identity_after_update
+        AFTER UPDATE OF server_id, panel_email, sub_id ON vpn_keys
+        WHEN OLD.server_id IS NOT NEW.server_id
+          OR OLD.panel_email IS NOT NEW.panel_email
+          OR OLD.sub_id IS NOT NEW.sub_id
+        BEGIN
+            INSERT INTO subscription_composition_sync (
+                host_key_id, state, desired_revision, applied_revision,
+                applied_tokens_json, attempts, next_attempt_at, lease_until,
+                last_error_code, updated_at
+            )
+            SELECT NEW.id, 'pending', 1, 0, '[]', 0, NULL, NULL,
+                   NULL, CURRENT_TIMESTAMP
+            WHERE EXISTS (
+                SELECT 1 FROM subscription_bindings
+                WHERE host_key_id = NEW.id
+            )
+            ON CONFLICT(host_key_id) DO UPDATE SET
+                state = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN state
+                    ELSE 'pending'
+                END,
+                desired_revision = desired_revision + 1,
+                attempts = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN attempts
+                    ELSE 0
+                END,
+                next_attempt_at = NULL,
+                lease_until = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN lease_until
+                    ELSE NULL
+                END,
+                lease_owner_token = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN lease_owner_token
+                    ELSE NULL
+                END,
+                last_error_code = NULL,
+                updated_at = CURRENT_TIMESTAMP;
+
+            INSERT INTO subscription_composition_sync (
+                host_key_id, state, desired_revision, applied_revision,
+                applied_tokens_json, attempts, next_attempt_at, lease_until,
+                last_error_code, updated_at
+            )
+            SELECT DISTINCT b.host_key_id, 'pending', 1, 0, '[]', 0,
+                   NULL, NULL, NULL, CURRENT_TIMESTAMP
+            FROM subscription_bindings AS b
+            WHERE b.component_key_id = NEW.id
+            ON CONFLICT(host_key_id) DO UPDATE SET
+                state = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN state
+                    ELSE 'pending'
+                END,
+                desired_revision = desired_revision + 1,
+                attempts = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN attempts
+                    ELSE 0
+                END,
+                next_attempt_at = NULL,
+                lease_until = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN lease_until
+                    ELSE NULL
+                END,
+                lease_owner_token = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN lease_owner_token
+                    ELSE NULL
+                END,
+                last_error_code = NULL,
+                updated_at = CURRENT_TIMESTAMP;
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS servers_subscription_capability_after_update
+        AFTER UPDATE OF is_active, panel_version ON servers
+        WHEN OLD.is_active IS NOT NEW.is_active
+          OR OLD.panel_version IS NOT NEW.panel_version
+        BEGIN
+            UPDATE subscription_composition_sync
+            SET state = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN state
+                    ELSE 'pending'
+                END,
+                desired_revision = desired_revision + 1,
+                attempts = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN attempts
+                    ELSE 0
+                END,
+                next_attempt_at = NULL,
+                lease_until = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN lease_until
+                    ELSE NULL
+                END,
+                lease_owner_token = CASE
+                    WHEN lease_until > CURRENT_TIMESTAMP THEN lease_owner_token
+                    ELSE NULL
+                END,
+                last_error_code = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE host_key_id IN (
+                SELECT id FROM vpn_keys WHERE server_id = NEW.id
+            );
+        END
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS semantic_action_contexts (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            owner_extension_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            workflow_id TEXT NOT NULL,
+            completion_handler TEXT,
+            state TEXT NOT NULL DEFAULT 'active'
+                CHECK(state IN ('active', 'consumed', 'canceled', 'expired')),
+            order_id TEXT REFERENCES payments(order_id) ON DELETE SET NULL,
+            expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            consumed_at TIMESTAMP,
+            UNIQUE(owner_extension_id, workflow_id),
+            CHECK(LENGTH(TRIM(token)) > 0),
+            CHECK(LENGTH(TRIM(owner_extension_id)) > 0),
+            CHECK(LENGTH(TRIM(action)) > 0),
+            CHECK(schema_version > 0),
+            CHECK(LENGTH(TRIM(workflow_id)) > 0),
+            CHECK(completion_handler IS NULL OR LENGTH(TRIM(completion_handler)) > 0)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_semantic_action_contexts_user_state
+        ON semantic_action_contexts(user_id, state, expires_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_semantic_action_contexts_order
+        ON semantic_action_contexts(order_id)
+        WHERE order_id IS NOT NULL
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS extension_completion_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            extension_id TEXT NOT NULL,
+            handler_name TEXT NOT NULL,
+            workflow_id TEXT NOT NULL,
+            order_id TEXT NOT NULL REFERENCES payments(order_id) ON DELETE CASCADE,
+            key_id INTEGER REFERENCES vpn_keys(id) ON DELETE SET NULL,
+            stage TEXT NOT NULL DEFAULT 'key_configured',
+            state TEXT NOT NULL DEFAULT 'waiting'
+                CHECK(state IN (
+                    'waiting', 'ready', 'processing', 'retry',
+                    'completed', 'degraded'
+                )),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_retry_at TIMESTAMP,
+            lease_until TIMESTAMP,
+            last_error_code TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            UNIQUE(extension_id, handler_name, workflow_id),
+            CHECK(LENGTH(TRIM(extension_id)) > 0),
+            CHECK(LENGTH(TRIM(handler_name)) > 0),
+            CHECK(LENGTH(TRIM(workflow_id)) > 0),
+            CHECK(attempts >= 0)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_extension_completion_jobs_due
+        ON extension_completion_jobs(state, next_retry_at, lease_until)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_payments_origin_workflow
+        ON payments(origin_extension_id, origin_workflow_id)
+        WHERE origin_extension_id IS NOT NULL
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_payments_origin_pending
+        ON payments(fulfillment_status, origin_extension_id)
+        WHERE origin_extension_id IS NOT NULL
+        """
+    )
+
+    host_select_buttons = [
+        {
+            'id': 'btn_subscription_host_items',
+            'label': '🔗 %item_name%',
+            'color': 'secondary',
+            'row': 0,
+            'col': 0,
+            'is_hidden': False,
+            'action_type': 'system_collection',
+            'action_value': None,
+        },
+        {
+            'id': 'btn_subscription_host_skip',
+            'label': '⏭ Продолжить отдельно',
+            'color': 'secondary',
+            'row': 1000,
+            'col': 0,
+            'is_hidden': False,
+            'action_type': 'system',
+            'action_value': None,
+        },
+    ]
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO pages (
+            page_key, text_default, buttons_default, updated_at
+        ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        """,
+        (
+            'key_subscription_host_select',
+            '🔗 <b>Основная подписка</b>\n\n'
+            'Выберите ключ, в подписку которого нужно добавить серверы '
+            'этого ключа.\n\nЭтот ключ также останется доступен отдельно. '
+            'Если вариантов больше 50, в списке показываются первые 50.',
+            json.dumps(host_select_buttons, ensure_ascii=False),
+        ),
+    )
+
+    logger.info(
+        "Migration v101 applied: subscription composition and durable "
+        "extension action origins enabled"
+    )
+
+
+_RETIRED_PAYMENT_PAGES_V102 = (
+    'balance_payment',
+    'crypto_payment',
+    'payment_status',
+)
+
+
+def _remove_v0_payment_buttons_v102(conn: sqlite3.Connection) -> int:
+    """Remove stored buttons whose system actions no longer exist."""
+    changed = 0
+    rows = conn.execute(
+        "SELECT page_key, buttons_default, buttons_custom FROM pages"
+    ).fetchall()
+    for row in rows:
+        updates: dict[str, str] = {}
+        for column, raw_value in (
+            ('buttons_default', row['buttons_default']),
+            ('buttons_custom', row['buttons_custom']),
+        ):
+            if raw_value is None:
+                continue
+            try:
+                buttons = json.loads(raw_value)
+            except (TypeError, json.JSONDecodeError):
+                logger.warning(
+                    "Migration v102 kept malformed %s on page %s unchanged",
+                    column,
+                    row['page_key'],
+                )
+                continue
+            if not isinstance(buttons, list):
+                continue
+            migrated = [
+                button
+                for button in buttons
+                if not (
+                    isinstance(button, dict)
+                    and str(button.get('id') or '').startswith(
+                        ('btn_pay_', 'btn_renew_pay_')
+                    )
+                )
+            ]
+            if len(migrated) != len(buttons):
+                updates[column] = json.dumps(migrated, ensure_ascii=False)
+                changed += 1
+        if updates:
+            assignments = ', '.join(f'{column} = ?' for column in updates)
+            conn.execute(
+                f"UPDATE pages SET {assignments}, updated_at = CURRENT_TIMESTAMP "
+                "WHERE page_key = ?",
+                (*updates.values(), row['page_key']),
+            )
+    return changed
+
+
+def _preserve_v0_provider_audit_v102(conn: sqlite3.Connection) -> int:
+    """Move provider-specific ids into the shared immutable audit table."""
+    payment_columns = _table_columns(conn, 'payments')
+    mappings = (
+        ('yookassa_payment_id', 'yookassa_qr', 'yookassa_qr'),
+        ('wata_link_id', 'wata', 'wata'),
+        ('platega_transaction_id', 'platega', 'platega'),
+        ('cardlink_bill_id', 'cardlink', 'cardlink'),
+    )
+    inserted = 0
+    for column, provider_id, payment_type in mappings:
+        if column not in payment_columns:
+            continue
+        cursor = conn.execute(
+            f"""
+            INSERT OR IGNORE INTO payment_provider_orders (
+                order_id, provider_id, payment_type, provider_payment_id,
+                status, metadata_json, purpose, charge_amount,
+                charge_currency, created_at, updated_at
+            )
+            SELECT
+                p.order_id, ?, COALESCE(NULLIF(p.payment_type, ''), ?),
+                p.{column},
+                CASE WHEN p.status = 'paid' THEN 'succeeded' ELSE 'canceled' END,
+                ?, p.purpose, p.charge_amount, p.charge_currency,
+                COALESCE(p.created_at, p.paid_at, CURRENT_TIMESTAMP),
+                COALESCE(p.paid_at, p.created_at, CURRENT_TIMESTAMP)
+            FROM payments AS p
+            WHERE p.intent_version <> 1
+              AND NULLIF(TRIM(p.{column}), '') IS NOT NULL
+            """,
+            (
+                provider_id,
+                payment_type,
+                json.dumps({'migrated_from': f'payments.{column}'}),
+            ),
+        )
+        inserted += max(0, int(cursor.rowcount or 0))
+
+    conn.execute(
+        """
+        UPDATE payment_provider_orders
+        SET status = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM payments p
+                    WHERE p.order_id = payment_provider_orders.order_id
+                      AND p.intent_version <> 1
+                      AND p.status = 'paid'
+                ) THEN 'succeeded'
+                ELSE 'canceled'
+            END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE EXISTS (
+            SELECT 1 FROM payments p
+            WHERE p.order_id = payment_provider_orders.order_id
+              AND p.intent_version <> 1
+        )
+        """
+    )
+    return inserted
+
+
+def _backfill_canonical_payment_history_v102(conn: sqlite3.Connection) -> None:
+    """Backfill canonical currency/minor fields before dropping v0 aliases."""
+    conn.execute(
+        """
+        UPDATE payments
+        SET base_currency = CASE
+                WHEN intent_version = 1
+                    THEN COALESCE(NULLIF(UPPER(base_currency), ''), 'RUB')
+                WHEN payment_type = 'crypto' THEN 'USDT'
+                WHEN payment_type = 'stars' THEN 'XTR'
+                ELSE 'RUB'
+            END,
+            nominal_amount_minor = CASE
+                WHEN payment_type IN ('trial', 'demo', 'promo_free') THEN 0
+                WHEN COALESCE(nominal_amount_minor, 0) <> 0
+                    THEN nominal_amount_minor
+                WHEN payment_type = 'stars' THEN COALESCE(
+                    NULLIF(original_amount_stars, 0),
+                    NULLIF(amount_stars, 0),
+                    0
+                )
+                WHEN payment_type = 'crypto' THEN COALESCE(
+                    NULLIF(original_amount_cents, 0),
+                    NULLIF(amount_cents, 0),
+                    0
+                )
+                ELSE COALESCE(
+                    NULLIF(original_amount_cents, 0),
+                    NULLIF(amount_cents, 0),
+                    NULLIF((
+                        SELECT CAST(ROUND(t.price_rub * 100) AS INTEGER)
+                        FROM tariffs t WHERE t.id = payments.tariff_id
+                    ), 0),
+                    NULLIF((
+                        SELECT t.price_minor
+                        FROM tariffs t WHERE t.id = payments.tariff_id
+                    ), 0),
+                    0
+                )
+            END,
+            payable_amount_minor = CASE
+                WHEN payment_type IN ('trial', 'demo', 'promo_free') THEN 0
+                WHEN COALESCE(payable_amount_minor, 0) <> 0
+                    THEN payable_amount_minor
+                WHEN payment_type = 'stars' THEN COALESCE(
+                    final_amount_stars,
+                    amount_stars,
+                    0
+                )
+                WHEN payment_type = 'crypto' THEN COALESCE(
+                    final_amount_cents,
+                    amount_cents,
+                    0
+                )
+                ELSE COALESCE(
+                    final_amount_cents,
+                    amount_cents,
+                    (
+                        SELECT CAST(ROUND(t.price_rub * 100) AS INTEGER)
+                        FROM tariffs t WHERE t.id = payments.tariff_id
+                    ),
+                    (
+                        SELECT t.price_minor
+                        FROM tariffs t WHERE t.id = payments.tariff_id
+                    ),
+                    0
+                )
+            END,
+            balance_deduct_minor = CASE
+                WHEN COALESCE(balance_deduct_minor, 0) <> 0
+                    THEN balance_deduct_minor
+                ELSE COALESCE(balance_deduct_cents, 0)
+            END,
+            purpose = CASE
+                WHEN intent_version <> 1 AND payment_type = 'trial'
+                    THEN 'trial'
+                WHEN intent_version <> 1 AND purpose = 'legacy_key_payment'
+                    THEN 'historical_key_payment'
+                ELSE purpose
+            END
+        """
+    )
+    conn.execute(
+        """
+        UPDATE tariffs
+        SET price_minor = CAST(ROUND(price_rub * 100) AS INTEGER)
+        WHERE COALESCE(price_minor, 0) = 0
+          AND COALESCE(price_rub, 0) > 0
+        """
+    )
+
+
+def _rebuild_payments_for_v102(conn: sqlite3.Connection) -> None:
+    """Drop provider-specific and duplicate amount columns from payments."""
+    conn.execute("DROP TABLE IF EXISTS payments_v102")
+    conn.execute(
+        """
+        CREATE TABLE payments_v102 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vpn_key_id INTEGER,
+            user_id INTEGER NOT NULL,
+            tariff_id INTEGER,
+            order_id TEXT NOT NULL UNIQUE,
+            payment_type TEXT,
+            period_days INTEGER,
+            status TEXT DEFAULT 'paid',
+            paid_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            promo_code_id INTEGER,
+            promo_code TEXT,
+            discount_percent INTEGER DEFAULT 0,
+            is_promo_free INTEGER DEFAULT 0,
+            intent_version INTEGER NOT NULL DEFAULT 1,
+            purpose TEXT NOT NULL,
+            purpose_data_json TEXT NOT NULL DEFAULT '{}',
+            charge_amount TEXT,
+            charge_currency TEXT,
+            rate_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            description TEXT,
+            success_target_json TEXT NOT NULL DEFAULT '{}',
+            cancel_target_json TEXT NOT NULL DEFAULT '{}',
+            fulfillment_status TEXT NOT NULL DEFAULT 'pending',
+            fulfillment_attempts INTEGER NOT NULL DEFAULT 0,
+            fulfillment_started_at TIMESTAMP,
+            fulfillment_last_error TEXT,
+            provider_confirmed_at TIMESTAMP,
+            fulfilled_at TIMESTAMP,
+            created_at TIMESTAMP,
+            base_currency TEXT NOT NULL DEFAULT 'RUB',
+            nominal_amount_minor INTEGER NOT NULL DEFAULT 0,
+            payable_amount_minor INTEGER NOT NULL DEFAULT 0,
+            balance_deduct_minor INTEGER NOT NULL DEFAULT 0,
+            origin_extension_id TEXT,
+            origin_context_version INTEGER,
+            origin_context_json TEXT NOT NULL DEFAULT '{}',
+            origin_workflow_id TEXT,
+            origin_completion_handler TEXT,
+            FOREIGN KEY (vpn_key_id) REFERENCES vpn_keys(id),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (tariff_id) REFERENCES tariffs(id)
+        )
+        """
+    )
+    columns = (
+        'id', 'vpn_key_id', 'user_id', 'tariff_id', 'order_id',
+        'payment_type', 'period_days', 'status', 'paid_at', 'promo_code_id',
+        'promo_code', 'discount_percent', 'is_promo_free', 'intent_version',
+        'purpose', 'purpose_data_json', 'charge_amount', 'charge_currency',
+        'rate_snapshot_json', 'description', 'success_target_json',
+        'cancel_target_json', 'fulfillment_status', 'fulfillment_attempts',
+        'fulfillment_started_at', 'fulfillment_last_error',
+        'provider_confirmed_at', 'fulfilled_at', 'created_at', 'base_currency',
+        'nominal_amount_minor', 'payable_amount_minor',
+        'balance_deduct_minor', 'origin_extension_id',
+        'origin_context_version', 'origin_context_json', 'origin_workflow_id',
+        'origin_completion_handler',
+    )
+    column_sql = ', '.join(columns)
+    conn.execute(
+        f"INSERT INTO payments_v102 ({column_sql}) "
+        f"SELECT {column_sql} FROM payments"
+    )
+    conn.execute("DROP TABLE payments")
+    conn.execute("ALTER TABLE payments_v102 RENAME TO payments")
+    conn.execute("CREATE INDEX idx_payments_order_id ON payments(order_id)")
+    conn.execute("CREATE INDEX idx_payments_user_id ON payments(user_id)")
+    conn.execute("CREATE INDEX idx_payments_paid_at ON payments(paid_at)")
+    conn.execute("CREATE INDEX idx_payments_promo_code_id ON payments(promo_code_id)")
+    conn.execute(
+        "CREATE INDEX idx_payments_key_status_paid_at "
+        "ON payments(vpn_key_id, status, paid_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_payments_status_paid_at ON payments(status, paid_at)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_payments_fulfillment "
+        "ON payments(fulfillment_status, provider_confirmed_at)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_payments_origin_workflow "
+        "ON payments(origin_extension_id, origin_workflow_id) "
+        "WHERE origin_extension_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX idx_payments_origin_pending "
+        "ON payments(fulfillment_status, origin_extension_id) "
+        "WHERE origin_extension_id IS NOT NULL"
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER trg_payments_require_v1_insert
+        BEFORE INSERT ON payments
+        WHEN NEW.intent_version <> 1
+        BEGIN
+            SELECT RAISE(ABORT, 'new payments require Payment Intent v1');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER trg_payments_prevent_v1_downgrade
+        BEFORE UPDATE OF intent_version ON payments
+        WHEN OLD.intent_version = 1 AND NEW.intent_version <> 1
+        BEGIN
+            SELECT RAISE(ABORT, 'Payment Intent v1 cannot be downgraded');
+        END
+        """
+    )
+
+
+def _rebuild_tariffs_for_v102(conn: sqlite3.Connection) -> None:
+    """Drop the physical derived RUB price while retaining canonical prices."""
+    dependent_triggers = conn.execute(
+        """
+        SELECT name, sql
+        FROM sqlite_master
+        WHERE type = 'trigger'
+          AND sql IS NOT NULL
+          AND LOWER(sql) LIKE '%tariffs%'
+        ORDER BY name
+        """
+    ).fetchall()
+    for trigger in dependent_triggers:
+        trigger_name = str(trigger['name']).replace('"', '""')
+        conn.execute(f'DROP TRIGGER "{trigger_name}"')
+
+    conn.execute("DROP TABLE IF EXISTS tariffs_v102")
+    conn.execute(
+        """
+        CREATE TABLE tariffs_v102 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            duration_days INTEGER NOT NULL,
+            display_order INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            traffic_limit_gb INTEGER DEFAULT 0,
+            group_id INTEGER DEFAULT 1,
+            max_ips INTEGER DEFAULT 1,
+            system_type TEXT,
+            price_minor INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO tariffs_v102 (
+            id, name, duration_days, display_order, is_active,
+            traffic_limit_gb, group_id, max_ips, system_type, price_minor
+        )
+        SELECT
+            id, name, duration_days, display_order, is_active,
+            traffic_limit_gb, group_id, max_ips, system_type, price_minor
+        FROM tariffs
+        """
+    )
+    conn.execute("DROP TABLE tariffs")
+    conn.execute("ALTER TABLE tariffs_v102 RENAME TO tariffs")
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_tariffs_admin_custom_group "
+        "ON tariffs(group_id) WHERE system_type = 'admin_custom'"
+    )
+    for trigger in dependent_triggers:
+        conn.execute(str(trigger['sql']))
+
+
+def migration_102(conn: sqlite3.Connection) -> None:
+    """Migration v102: retire Payment Intent v0 runtime and physical aliases."""
+    pending_v0 = int(conn.execute(
+        """
+        SELECT COUNT(*) FROM payments
+        WHERE intent_version <> 1 AND status = 'pending'
+        """
+    ).fetchone()[0])
+    if pending_v0:
+        raise RuntimeError(
+            "Payment Intent v0 cleanup requires manual reconciliation of "
+            f"{pending_v0} pending historical order(s)"
+        )
+
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    inserted_audit_rows = 0
+    removed_button_sets = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        inserted_audit_rows = _preserve_v0_provider_audit_v102(conn)
+        conn.execute(
+            """
+            DELETE FROM payment_auto_checks
+            WHERE EXISTS (
+                SELECT 1 FROM payments p
+                WHERE p.order_id = payment_auto_checks.order_id
+                  AND p.intent_version <> 1
+            )
+            """
+        )
+        conn.execute(
+            """
+            UPDATE promo_redemptions
+            SET status = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM payments p
+                        WHERE p.order_id = promo_redemptions.order_id
+                          AND p.status = 'paid'
+                    ) THEN 'applied'
+                    ELSE 'canceled'
+                END
+            WHERE status = 'reserved'
+              AND EXISTS (
+                    SELECT 1 FROM payments p
+                    WHERE p.order_id = promo_redemptions.order_id
+                      AND p.intent_version <> 1
+              )
+            """
+        )
+        _backfill_canonical_payment_history_v102(conn)
+        _rebuild_payments_for_v102(conn)
+        _rebuild_tariffs_for_v102(conn)
+
+        conn.execute(
+            "DELETE FROM page_routes WHERE page_key IN (?, ?, ?)",
+            _RETIRED_PAYMENT_PAGES_V102,
+        )
+        conn.execute(
+            "DELETE FROM pages WHERE page_key IN (?, ?, ?)",
+            _RETIRED_PAYMENT_PAGES_V102,
+        )
+        removed_button_sets = _remove_v0_payment_buttons_v102(conn)
+
+        foreign_key_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_errors:
+            raise RuntimeError(
+                "foreign_key_check failed after Payment Intent v0 cleanup: "
+                f"{foreign_key_errors[:5]}"
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+    logger.info(
+        "Migration v102 applied: provider_audit_rows=%s, "
+        "removed_button_sets=%s",
+        inserted_audit_rows,
+        removed_button_sets,
+    )
+
+
+def migration_103(conn: sqlite3.Connection) -> None:
+    """Migration v103: add support ticket activity and history indexes."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_support_threads_activity "
+        "ON support_threads(last_message_at DESC, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_support_threads_status_activity "
+        "ON support_threads(status, last_message_at DESC, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_support_messages_thread_id "
+        "ON support_messages(thread_id, id)"
+    )
+
+
 MIGRATIONS = {
     98: migration_98,
     99: migration_99,
+    100: migration_100,
+    101: migration_101,
+    102: migration_102,
+    103: migration_103,
 }
 
 

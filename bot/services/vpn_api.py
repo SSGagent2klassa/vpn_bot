@@ -124,6 +124,59 @@ async def get_client(server_id: int) -> XUIClient:
     return get_client_from_server_data(server)  # type: ignore[return-value]
 
 
+def supports_client_external_links(client: BaseVPNClient) -> bool:
+    """Return the adapter's stored, side-effect-free composition capability."""
+    return bool(client.supports_client_external_links())
+
+
+async def refresh_client_capabilities(client: BaseVPNClient) -> bool:
+    """Refresh live capability metadata before a gated panel mutation."""
+    refresher = getattr(client, "refresh_capabilities", None)
+    if callable(refresher):
+        result = refresher()
+        result = await result if inspect.isawaitable(result) else result
+        return bool(result)
+    return bool(await client.login())
+
+
+async def get_client_external_links(
+    *,
+    server_id: int,
+    panel_email: str,
+    client: Optional[BaseVPNClient] = None,
+) -> List[Dict[str, Any]]:
+    """Read all external links for one bot-owned logical client."""
+    if not is_managed_panel_email(panel_email):
+        raise VPNAPIError(
+            f"Refusing to read external links for unmanaged panel client: {panel_email!r}"
+        )
+    panel_client = client or await get_client(server_id)
+    links = panel_client.get_client_external_links(panel_email)
+    links = await links if inspect.isawaitable(links) else links
+    if not isinstance(links, list) or any(not isinstance(item, dict) for item in links):
+        raise VPNAPIError("Panel adapter returned an invalid external-link collection")
+    return [dict(item) for item in links]
+
+
+@regular_panel_operation
+async def replace_client_external_links(
+    *,
+    server_id: int,
+    panel_email: str,
+    links: Iterable[Dict[str, Any]],
+    client: Optional[BaseVPNClient] = None,
+) -> bool:
+    """Replace all external links for one bot-owned logical client."""
+    if not is_managed_panel_email(panel_email):
+        raise VPNAPIError(
+            f"Refusing to write external links for unmanaged panel client: {panel_email!r}"
+        )
+    panel_client = client or await get_client(server_id)
+    result = panel_client.replace_client_external_links(panel_email, links)
+    result = await result if inspect.isawaitable(result) else result
+    return bool(result)
+
+
 async def test_server_connection(server_data: Dict[str, Any]) -> Dict[str, Any]:
     """Validate the complete supported contract and return a neutral failure."""
     client = XUIClient(server_data)
@@ -571,14 +624,51 @@ async def ensure_subscription_keys_on_server(
     panel_snapshot: Optional[PanelServerSnapshot] = None,
     dry_run: bool = False,
 ) -> Dict[str, int]:
+    """Reconcile one key and make every non-preview failure observable."""
     context = _unlocked_preview() if dry_run else panel_sync_coordinator.regular()
     async with context:
-        return await _ensure_subscription_keys_on_server_impl(
+        try:
+            stats = await _ensure_subscription_keys_on_server_impl(
+                key_id,
+                reset_traffic=reset_traffic,
+                panel_snapshot=panel_snapshot,
+                dry_run=dry_run,
+            )
+        except Exception as error:
+            if not dry_run:
+                logger.warning(
+                    "panel_key_sync_failed key_id=%s reset_traffic=%s "
+                    "snapshot_reused=%s exception_type=%s",
+                    key_id,
+                    int(bool(reset_traffic)),
+                    int(panel_snapshot is not None),
+                    type(error).__name__,
+                    exc_info=True,
+                )
+            raise
+
+    if not dry_run and (
+        not bool(stats.get("ok"))
+        or int(stats.get("errors", 0) or 0) != 0
+    ):
+        logger.warning(
+            "panel_key_sync_incomplete key_id=%s reset_traffic=%s "
+            "snapshot_reused=%s created=%s deleted=%s enabled=%s "
+            "disabled=%s updated=%s skipped=%s reset=%s errors=%s ok=%s",
             key_id,
-            reset_traffic=reset_traffic,
-            panel_snapshot=panel_snapshot,
-            dry_run=dry_run,
+            int(bool(reset_traffic)),
+            int(panel_snapshot is not None),
+            stats.get("created", 0),
+            stats.get("deleted", 0),
+            stats.get("enabled", 0),
+            stats.get("disabled", 0),
+            stats.get("updated", 0),
+            stats.get("skipped", 0),
+            stats.get("reset", 0),
+            stats.get("errors", 0),
+            stats.get("ok", 0),
         )
+    return stats
 
 
 async def sync_key_to_panel_state(
@@ -599,7 +689,17 @@ async def push_key_to_panel(key_id: int, reset_traffic: bool = False) -> bool:
     return bool(stats.get("ok")) and not stats.get("errors")
 
 
-async def get_subscription_url_for_key(key: Dict[str, Any]) -> Optional[str]:
+async def get_subscription_url_for_key(
+    key: Dict[str, Any],
+    *,
+    suppress_errors: bool = True,
+) -> Optional[str]:
+    """Resolve a key subscription URL.
+
+    Interactive callers keep the historical ``None`` fallback. Durable
+    reconciliation disables suppression so a transient component-panel error
+    cannot be mistaken for an absent URL and remove an already managed link.
+    """
     sub_id = key.get("sub_id")
     server_id = key.get("server_id")
     if not sub_id or not server_id:
@@ -609,6 +709,8 @@ async def get_subscription_url_for_key(key: Dict[str, Any]) -> Optional[str]:
         return await client.get_subscription_link(str(sub_id))
     except Exception:
         logger.exception("Could not build subscription URL key_id=%s", key.get("id"))
+        if not suppress_errors:
+            raise
         return None
 
 
@@ -621,6 +723,7 @@ __all__ = [
     "extend_key_on_server",
     "format_traffic",
     "get_client",
+    "get_client_external_links",
     "get_client_from_server_data",
     "get_client_inbound_descriptors",
     "get_key_expiry_time_ms",
@@ -630,9 +733,12 @@ __all__ = [
     "invalidate_client_cache",
     "provision_client_on_server",
     "push_key_to_panel",
+    "refresh_client_capabilities",
+    "replace_client_external_links",
     "reset_key_traffic_if_active",
     "restore_key_traffic_limit",
     "restore_traffic_limit_in_db",
     "sync_key_to_panel_state",
+    "supports_client_external_links",
     "test_server_connection",
 ]

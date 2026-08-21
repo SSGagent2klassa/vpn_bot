@@ -26,7 +26,7 @@ class PaymentCompletionResult:
     retryable: bool = False
 
     def as_dict(self) -> dict[str, Any]:
-        """Compatibility view for integrations that serialize completion results."""
+        """Return the stable serialized Payment Intent v1 result."""
         return {
             "ok": self.ok,
             "order_id": self.order_id,
@@ -47,14 +47,7 @@ def _normalized_purpose(order: Mapping[str, Any]) -> str:
     purpose = str(order.get("purpose") or "").strip()
     if purpose in {"key_purchase", "key_renewal", "balance_topup"}:
         return purpose
-    action = str(order.get("_payment_action") or "").strip()
-    if action in {"key_purchase", "new_key"}:
-        return "key_purchase"
-    if action in {"key_renewal", "renewal"}:
-        return "key_renewal"
-    if action == "balance_topup":
-        return action
-    return "key_renewal" if order.get("vpn_key_id") else "key_purchase"
+    return ""
 
 
 async def _render_interactive_page(
@@ -105,19 +98,11 @@ async def _render_primary_result(
             currency = str(order.get("base_currency") or "RUB")
             context.update({
                 "payment_nominal_text": format_base_minor(
-                    int(
-                        order.get("nominal_amount_minor")
-                        or order.get("nominal_amount_cents")
-                        or 0
-                    ),
+                    int(order.get("nominal_amount_minor") or 0),
                     currency,
                 ),
                 "payment_amount_text": format_base_minor(
-                    int(
-                        order.get("payable_amount_minor")
-                        or order.get("payable_amount_cents")
-                        or 0
-                    ),
+                    int(order.get("payable_amount_minor") or 0),
                     currency,
                 ),
             })
@@ -181,19 +166,11 @@ async def _render_primary_result(
         "order_id": order_id,
         "payment_purpose": purpose,
         "payment_nominal_text": format_base_minor(
-            int(
-                order.get("nominal_amount_minor")
-                or order.get("nominal_amount_cents")
-                or 0
-            ),
+            int(order.get("nominal_amount_minor") or 0),
             currency,
         ),
         "payment_amount_text": format_base_minor(
-            int(
-                order.get("payable_amount_minor")
-                or order.get("payable_amount_cents")
-                or 0
-            ),
+            int(order.get("payable_amount_minor") or 0),
             currency,
         ),
     }
@@ -260,6 +237,32 @@ async def _run_key_setup_without_delivery(
             result,
             expected_telegram_id=telegram_id,
         )
+    if result.status is NewKeySetupStatus.READY:
+        from bot.services.extension_completion import (
+            run_extension_completion_after_key_configured,
+        )
+        from bot.handlers.user.subscription_hosts import (
+            offer_default_subscription_host,
+        )
+
+        await run_extension_completion_after_key_configured(
+            result.order_id,
+            key_id=result.key_id,
+        )
+        try:
+            await offer_default_subscription_host(
+                None,
+                component_key_id=result.key_id,
+                telegram_id=telegram_id,
+            )
+        except Exception as error:
+            logger.warning(
+                "Post-configuration subscription host flow failed "
+                "without delivery order=%s key=%s type=%s",
+                result.order_id,
+                result.key_id,
+                type(error).__name__,
+            )
     return result
 
 
@@ -292,9 +295,6 @@ async def complete_confirmed_payment(
     background: bool = False,
     notify_user: bool = True,
     show_primary_result: bool = True,
-    payment_type: str | None = None,
-    referral_amount: int | None = None,
-    retry_post_actions: bool = False,
 ) -> PaymentCompletionResult:
     """Complete and continue one provider-confirmed order through one code path."""
     from bot.services import billing
@@ -307,6 +307,16 @@ async def complete_confirmed_payment(
             ok=False,
             order_id=normalized_order_id,
             text="order_not_found",
+        )
+    if int(initial_order.get("intent_version") or 0) != 1:
+        logger.warning(
+            "Rejected non-v1 payment completion order=%s",
+            normalized_order_id,
+        )
+        return PaymentCompletionResult(
+            ok=False,
+            order_id=normalized_order_id,
+            text="payment_intent_required",
         )
 
     initial_payment_completed = str(initial_order.get("status") or "") == "paid"
@@ -345,17 +355,6 @@ async def complete_confirmed_payment(
             payment_completed=initial_payment_completed,
         )
 
-    balance_override = 0
-    if state is not None:
-        try:
-            state_data = await state.get_data()
-            balance_override = int(state_data.get("balance_to_deduct") or 0)
-        except Exception:
-            logger.warning(
-                "Failed to load payment FSM balance data order=%s",
-                normalized_order_id,
-            )
-
     completion_order: Mapping[str, Any] = initial_order
     purpose = initial_purpose
     processed_now = False
@@ -367,7 +366,6 @@ async def complete_confirmed_payment(
         success, text, order = await billing.process_payment_order(
             normalized_order_id,
             bot=bot,
-            process_referrals=False,
         )
         if not success or not order:
             failed_order = order or initial_order
@@ -396,19 +394,6 @@ async def complete_confirmed_payment(
         completion_order = order
         processed_now = bool(order.get("_payment_processed_now", True))
         payment_completed = True
-        if processed_now or retry_post_actions:
-            await billing._run_payment_post_actions(
-                order,
-                bot=bot,
-                payment_type=str(payment_type or order.get("payment_type") or ""),
-                referral_amount=(
-                    int(referral_amount)
-                    if referral_amount is not None
-                    else billing._payment_order_referral_amount(order)
-                ),
-                balance_override_cents=balance_override,
-                force=retry_post_actions,
-            )
 
         if state is not None:
             await state.update_data(balance_to_deduct=0, remaining_cents=0)

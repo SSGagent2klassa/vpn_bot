@@ -23,6 +23,8 @@ from database.db_key_cleanup import *
 from database.db_payment_providers import *
 from database.db_payment_auto_checks import *
 from database.db_payment_intents import *
+from database.db_action_contexts import *
+from database.db_extension_completion import *
 from database.db_currency import *
 from database.db_broadcast_editor import *
 from database.db_backup import *
@@ -32,3 +34,4 @@ from database.db_promotions import *
 from database.db_lapsed_coupons import *
 from database.db_user_ui_texts import *
 from database.db_trial import *
+from database.db_subscription_composition import *

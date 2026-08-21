@@ -15,9 +15,9 @@ def paid_key_purchase_predicate(alias: str) -> str:
         {alias}.status = 'paid'
         AND COALESCE(
             NULLIF({alias}.purpose, ''),
-            'legacy_key_payment'
+            'historical_key_payment'
         ) IN (
-            'legacy_key_payment',
+            'historical_key_payment',
             'key_purchase',
             'key_renewal'
         )

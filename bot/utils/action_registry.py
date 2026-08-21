@@ -362,6 +362,19 @@ def _resolve_activate_trial(ctx: dict) -> Optional[dict]:
     return {'callback_data': f'trial_activate:{offer_id}'}
 
 
+def _resolve_subscription_host_skip(ctx: dict) -> Optional[dict]:
+    component_key_id = ctx.get('component_key_id')
+    if (
+        isinstance(component_key_id, bool)
+        or not isinstance(component_key_id, int)
+        or component_key_id <= 0
+    ):
+        return None
+    return {
+        'callback_data': f'subscription_host_skip:{component_key_id}',
+    }
+
+
 # Map: button_id → handler
 SYSTEM_BUTTONS: Dict[str, Callable[[dict], Optional[dict]]] = {
     "btn_activate_trial": _resolve_activate_trial,
@@ -394,6 +407,7 @@ SYSTEM_BUTTONS: Dict[str, Callable[[dict], Optional[dict]]] = {
     "btn_tariff_back": lambda ctx: _resolve_context_callback(ctx, "tariff_back_callback"),
     "btn_key_flow_back": lambda ctx: _resolve_context_callback(ctx, "key_flow_back_callback"),
     "btn_key_flow_confirm": lambda ctx: _resolve_context_callback(ctx, "key_flow_confirm_callback"),
+    "btn_subscription_host_skip": _resolve_subscription_host_skip,
 }
 
 
@@ -410,6 +424,10 @@ SYSTEM_COLLECTIONS: Dict[str, Callable[[dict], list[dict]]] = {
     "btn_server_items": lambda ctx: _resolve_context_collection("server_button_items", ctx),
     "btn_key_items": lambda ctx: _resolve_context_collection("key_button_items", ctx),
     "btn_tariff_group_items": lambda ctx: _resolve_context_collection("tariff_group_button_items", ctx),
+    "btn_subscription_host_items": lambda ctx: _resolve_context_collection(
+        "subscription_host_button_items",
+        ctx,
+    ),
 }
 
 

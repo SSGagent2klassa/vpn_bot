@@ -80,7 +80,7 @@ def get_vpn_key_by_id(key_id: int) -> Optional[Dict[str, Any]]:
         cursor = conn.execute("""
             SELECT 
                 vk.*,
-                t.name as tariff_name, t.duration_days, t.price_rub, t.price_minor,
+                t.name as tariff_name, t.duration_days, t.price_minor,
                 t.traffic_limit_gb as tariff_traffic_limit_gb,
                 t.max_ips as tariff_max_ips, t.group_id as tariff_group_id,
                 t.system_type as tariff_system_type,
@@ -557,7 +557,8 @@ def update_key_notified_pct(key_id: int, pct: int) -> None:
 def reset_key_traffic_notification(key_id: int) -> None:
     """
     Resets traffic notifications and usage cache.
-    Called when a key is renewed (when traffic is dropped on the server).
+    Called only by intentional traffic-reset flows, such as the administrator
+    reset action and enabled monthly quota resets.
     
     Args:
         key_id: Key ID
@@ -853,7 +854,7 @@ def get_key_details_for_user(key_id: int, telegram_id: int) -> Optional[Dict[str
             SELECT 
                 vk.*, 
                 s.name as server_name, s.id as server_id,
-                t.name as tariff_name, t.duration_days, t.price_rub, t.price_minor,
+                t.name as tariff_name, t.duration_days, t.price_minor,
                 COALESCE((SELECT value FROM settings WHERE key = 'base_currency'), 'RUB') AS base_currency,
                 COALESCE(vk.max_ips_override, t.max_ips) as tariff_max_ips,
                 t.group_id as tariff_group_id,

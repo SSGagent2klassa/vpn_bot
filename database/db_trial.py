@@ -7,7 +7,7 @@ from typing import Any
 
 from .connection import get_db
 from .db_keys import _create_initial_vpn_key_with_conn
-from .db_payments import _complete_order_with_conn, _create_pending_order_with_conn
+from .payment_order_ids import build_payment_order_id
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,44 @@ __all__ = [
     'trial_offer_action_value',
     'claim_trial_offer',
 ]
+
+
+def _create_trial_history_with_conn(
+    conn: sqlite3.Connection,
+    *,
+    user_id: int,
+    tariff_id: int,
+    vpn_key_id: int,
+    duration_days: int,
+) -> tuple[int, str]:
+    """Insert one completed non-financial trial history row atomically."""
+    base_row = conn.execute(
+        "SELECT value FROM settings WHERE key = 'base_currency'"
+    ).fetchone()
+    base_currency = str(base_row['value'] if base_row else 'RUB').upper()
+    cursor = conn.execute(
+        """
+        INSERT INTO payments (
+            user_id, tariff_id, order_id, payment_type, vpn_key_id,
+            period_days, status, paid_at, intent_version, purpose,
+            purpose_data_json, base_currency, nominal_amount_minor,
+            payable_amount_minor, fulfillment_status, fulfilled_at, created_at
+        )
+        VALUES (
+            ?, ?, 'trial-pending', 'trial', ?, ?, 'paid', CURRENT_TIMESTAMP,
+            1, 'trial', '{}', ?, 0, 0, 'completed', CURRENT_TIMESTAMP,
+            CURRENT_TIMESTAMP
+        )
+        """,
+        (int(user_id), int(tariff_id), int(vpn_key_id), int(duration_days), base_currency),
+    )
+    payment_id = int(cursor.lastrowid)
+    order_id = build_payment_order_id(payment_id)
+    conn.execute(
+        "UPDATE payments SET order_id = ? WHERE id = ?",
+        (order_id, payment_id),
+    )
+    return payment_id, order_id
 
 
 _TRIAL_OFFER_SELECT = """
@@ -464,15 +502,13 @@ def claim_trial_offer(user_id: int, offer_id: int) -> dict[str, Any]:
             duration_days,
             traffic_limit,
         )
-        payment_id, order_id = _create_pending_order_with_conn(
+        payment_id, order_id = _create_trial_history_with_conn(
             conn,
-            normalized_user_id,
-            int(offer['tariff_id']),
-            'trial',
-            key_id,
+            user_id=normalized_user_id,
+            tariff_id=int(offer['tariff_id']),
+            vpn_key_id=key_id,
+            duration_days=duration_days,
         )
-        if not _complete_order_with_conn(conn, order_id):
-            raise RuntimeError('failed to complete atomic trial order')
 
         activation_id = int(activation_cursor.lastrowid)
         conn.execute(

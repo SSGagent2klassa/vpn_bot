@@ -149,30 +149,91 @@ async def dispatch_extension_callback(context: Mapping[str, Any], *, bot: Any = 
 
 
 def normalize_extension_callback_result(raw_result: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Checks the declarative result of a callback handler."""
+    """Check the legacy render result or one strict callback-to-core action result."""
     if raw_result is None:
         return {}
     if not isinstance(raw_result, Mapping):
-        raise ValueError('extension callback должен вернуть dict или None')
-    allowed = {'answer_text', 'show_alert', 'page_key', 'route_key', 'context'}
+        raise ValueError('extension callback must return a mapping or None')
+    allowed = {
+        'answer_text',
+        'show_alert',
+        'page_key',
+        'route_key',
+        'context',
+        'target',
+        'action',
+        'params',
+        'origin_context',
+    }
     result = dict(raw_result)
-    unknown = set(result.keys()) - allowed
+    unknown = set(result) - allowed
     if unknown:
-        raise ValueError(f"неподдерживаемые поля callback result: {', '.join(sorted(unknown))}")
-    if 'answer_text' in result and result['answer_text'] is not None and not isinstance(result['answer_text'], str):
-        raise ValueError('answer_text должен быть строкой')
+        raise ValueError(
+            f"unsupported extension callback result fields: {', '.join(sorted(unknown))}"
+        )
+
+    if 'target' in result:
+        target = result.get('target')
+        if not isinstance(target, str) or target.strip().casefold() != 'core_action':
+            raise ValueError('extension callback target must be core_action')
+        result['target'] = 'core_action'
+        irrelevant = set(result) - {'target', 'action', 'params', 'origin_context'}
+        if irrelevant:
+            raise ValueError(
+                f"unsupported fields for core_action callback result: "
+                f"{', '.join(sorted(irrelevant))}"
+            )
+        from bot.utils.action_origin_context import (
+            normalize_public_origin_context_envelope,
+        )
+        from bot.utils.action_policy import (
+            normalize_core_action,
+            normalize_core_action_params,
+        )
+
+        result['action'] = normalize_core_action(result.get('action'))
+        result['params'] = normalize_core_action_params(
+            result['action'],
+            result.get('params'),
+        )
+        if 'origin_context' in result:
+            if result['action'] != 'key.purchase.start':
+                raise ValueError(
+                    'origin_context is supported only for key.purchase.start'
+                )
+            result['origin_context'] = normalize_public_origin_context_envelope(
+                result['origin_context']
+            )
+        return result
+
+    orphaned = set(result) & {'action', 'params', 'origin_context'}
+    if orphaned:
+        raise ValueError(
+            f"callback result fields require target=core_action: "
+            f"{', '.join(sorted(orphaned))}"
+        )
+    if (
+        'answer_text' in result
+        and result['answer_text'] is not None
+        and not isinstance(result['answer_text'], str)
+    ):
+        raise ValueError('answer_text must be a string')
     if 'show_alert' in result and not isinstance(result['show_alert'], bool):
-        raise ValueError('show_alert должен быть bool')
+        raise ValueError('show_alert must be bool')
     for field in ('page_key', 'route_key'):
-        if field in result and result[field] is not None and not isinstance(result[field], str):
-            raise ValueError(f'{field} должен быть строкой')
+        if (
+            field in result
+            and result[field] is not None
+            and not isinstance(result[field], str)
+        ):
+            raise ValueError(f'{field} must be a string')
     if result.get('page_key') and result.get('route_key'):
-        raise ValueError('нельзя одновременно вернуть page_key и route_key')
+        raise ValueError('page_key and route_key are mutually exclusive')
     if 'context' in result:
         if result['context'] is None:
             result['context'] = {}
         if not isinstance(result['context'], Mapping):
-            raise ValueError('context должен быть mapping')
+            raise ValueError('context must be a mapping')
         result['context'] = dict(result['context'])
     return result
 

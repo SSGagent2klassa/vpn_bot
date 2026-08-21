@@ -15,13 +15,21 @@ async def apply_extension_core_operation(
     target_user_id: int,
     amount: int,
     reason: str,
+    performed_by: int | None = None,
 ) -> dict[str, Any]:
     """Applies the allowed core extension command through domain services."""
     from database.requests import (
+        build_extension_core_request_fingerprint,
         claim_extension_core_operation,
         finalize_extension_core_operation,
     )
 
+    request_fingerprint = build_extension_core_request_fingerprint(
+        operation=operation,
+        target_user_id=target_user_id,
+        amount=amount,
+        reason=reason,
+    )
     claimed = claim_extension_core_operation(
         extension_id=extension_id,
         idempotency_key=idempotency_key,
@@ -29,6 +37,7 @@ async def apply_extension_core_operation(
         target_user_id=target_user_id,
         amount=amount,
         reason=reason,
+        request_fingerprint=request_fingerprint,
     )
     if not claimed.get('claimed'):
         return _with_public_flags(claimed)
@@ -49,6 +58,15 @@ async def apply_extension_core_operation(
                 extension_id=extension_id,
                 idempotency_key=idempotency_key,
                 reason=reason,
+            )
+        elif operation == 'debit_balance':
+            domain_result = await _debit_balance(
+                target_user_id,
+                amount,
+                extension_id=extension_id,
+                idempotency_key=idempotency_key,
+                reason=reason,
+                performed_by=performed_by,
             )
         else:
             domain_result = {
@@ -71,6 +89,8 @@ async def apply_extension_core_operation(
         'operation': operation,
         'target_user_id': target_user_id,
         'amount': amount,
+        'amount_minor': amount,
+        'performed_by': performed_by,
         **{k: v for k, v in domain_result.items() if k not in {'ok'}},
     }
     finalized = finalize_extension_core_operation(
@@ -79,6 +99,9 @@ async def apply_extension_core_operation(
         status=status,
         metadata=metadata,
     )
+    if domain_result.get('already_applied') or domain_result.get('status') == 'already_applied':
+        finalized['status'] = 'already_applied'
+        finalized['already_applied'] = True
     return _with_public_flags(finalized)
 
 
@@ -130,12 +153,41 @@ async def _add_balance_bonus(
     )
 
 
+async def _debit_balance(
+    user_id: int,
+    amount_minor: int,
+    *,
+    extension_id: str,
+    idempotency_key: str,
+    reason: str,
+    performed_by: int | None,
+) -> dict[str, Any]:
+    from bot.services.balance import debit_user_balance
+
+    return await debit_user_balance(
+        user_id,
+        amount_minor,
+        source='extension_core',
+        reason=reason,
+        reference_type='extension_core_operation',
+        reference_id=f'{extension_id}:{idempotency_key}',
+        performed_by=performed_by,
+        metadata={
+            'extension_id': extension_id,
+            'idempotency_key': idempotency_key,
+            'performed_by': performed_by,
+        },
+    )
+
+
 def _status_from_domain_result(result: dict[str, Any]) -> str:
     status = str(result.get('status') or '')
     if result.get('ok'):
         return 'applied'
     if status in {'no_op', 'rejected', 'failed'}:
         return status
+    if status == 'insufficient_funds':
+        return 'rejected'
     if status in {'no_active_key', 'user_not_found'}:
         return 'no_op'
     return 'failed'
@@ -144,12 +196,32 @@ def _status_from_domain_result(result: dict[str, Any]) -> str:
 def _with_public_flags(result: dict[str, Any]) -> dict[str, Any]:
     status = result.get('status')
     stored = result.get('stored_status') or status
-    return {
+    metadata = result.get('metadata') if isinstance(result.get('metadata'), dict) else {}
+    domain_status = metadata.get('status')
+    if status == 'idempotency_conflict':
+        stored = 'idempotency_conflict'
+    if stored in {'no_op', 'rejected', 'failed'} and domain_status:
+        status = domain_status
+    public = {
         **result,
+        'status': status,
         'ok': stored == 'applied',
         'applied': status == 'applied' and not result.get('already_applied'),
         'already_applied': bool(result.get('already_applied')),
     }
+    for key in (
+        'operation_id',
+        'operation_type',
+        'amount_minor',
+        'delta_minor',
+        'currency',
+        'balance_before',
+        'balance_after',
+        'performed_by',
+    ):
+        if key in metadata:
+            public[key] = metadata[key]
+    return public
 
 
 __all__ = ['apply_extension_core_operation']

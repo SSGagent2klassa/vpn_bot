@@ -59,54 +59,29 @@ def _format_payment_amount(order: Dict[str, Any]) -> str:
         Formatted Amount String
     """
     payment_type = order.get('payment_type', '')
-
-    if int(order.get('intent_version') or 0) == 1:
-        from bot.services.money import format_money_minor, parse_major_to_minor
-
-        charge_currency = str(order.get('charge_currency') or order.get('base_currency') or 'RUB')
-        if order.get('charge_amount') not in {None, ''}:
-            try:
-                return format_money_minor(
-                    parse_major_to_minor(order.get('charge_amount'), charge_currency),
-                    charge_currency,
-                )
-            except (TypeError, ValueError):
-                pass
-        return format_money_minor(
-            order.get('payable_amount_minor') or order.get('payable_amount_cents') or 0,
-            order.get('base_currency') or 'RUB',
-        )
-
-    if payment_type == 'crypto':
-        cents = order.get('final_amount_cents') if order.get('final_amount_cents') is not None else order.get('amount_cents', 0) or 0
-        usd = cents / 100
-        usd_str = f'{usd:g}'.replace('.', ',')
-        return f'${usd_str} USDT'
-
-    if payment_type == 'stars':
-        stars = order.get('final_amount_stars') if order.get('final_amount_stars') is not None else order.get('amount_stars', 0) or 0
-        return f'{stars} ⭐'
-
     if payment_type in ('trial', 'promo_free'):
         return 'Бесплатно'
 
-    # For ruble methods (cards, yookassa_qr, wata, platega, cardlink, balance, demo)
-    if order.get('final_amount_cents') is not None:
-        price_rub = (order.get('final_amount_cents') or 0) / 100
-        price_str = f'{price_rub:g}'.replace('.', ',')
-        return f'{price_str} ₽'
-    if order.get('final_amount_cents') is not None:
-        price_rub = (order.get('final_amount_cents') or 0) / 100
-    else:
-        price_rub = order.get('price_rub', 0) or 0
-    if price_rub > 0:
-        price_str = f'{price_rub:g}'.replace('.', ',')
-        return f'{price_str} ₽'
+    from bot.services.money import format_money_minor, parse_major_to_minor
 
-    return '—'
+    charge_currency = str(
+        order.get('charge_currency') or order.get('base_currency') or 'RUB'
+    )
+    if order.get('charge_amount') not in {None, ''}:
+        try:
+            return format_money_minor(
+                parse_major_to_minor(order.get('charge_amount'), charge_currency),
+                charge_currency,
+            )
+        except (TypeError, ValueError):
+            pass
+    return format_money_minor(
+        order.get('payable_amount_minor') or 0,
+        order.get('base_currency') or 'RUB',
+    )
 
 
-def _get_payment_action(order: Dict[str, Any]) -> str:
+def _get_payment_notification_kind(order: Dict[str, Any]) -> str:
     """
     Returns the operation type for the notification.
 
@@ -125,15 +100,7 @@ def _get_payment_action(order: Dict[str, Any]) -> str:
     if purpose_action:
         return purpose_action
 
-    explicit_action = order.get('_payment_action')
-    explicit_action = {
-        'key_purchase': 'new_key',
-        'key_renewal': 'renewal',
-    }.get(explicit_action, explicit_action)
-    if explicit_action in ('new_key', 'renewal', 'trial'):
-        return explicit_action
-
-    return 'renewal' if order.get('vpn_key_id') else 'new_key'
+    return 'unknown'
 
 
 def _get_action_text(order: Dict[str, Any]) -> str:
@@ -146,12 +113,14 @@ def _get_action_text(order: Dict[str, Any]) -> str:
     Returns:
         Action text
     """
-    action = _get_payment_action(order)
+    action = _get_payment_notification_kind(order)
     if action == 'trial':
         return '🎁 Пробная подписка'
     if action == 'renewal':
         return '🔄 Продление'
-    return '🆕 Новый ключ'
+    if action == 'new_key':
+        return '🆕 Новый ключ'
+    return '💳 Платёж'
 
 
 def _format_user_name(user: Optional[Dict[str, Any]]) -> str:
@@ -182,39 +151,14 @@ def _format_user_login(user: Optional[Dict[str, Any]]) -> str:
     return '—'
 
 
-def _format_rub_cents(cents: int) -> str:
-    """Formats kopecks into rubles without extra zeros."""
-    rub = (cents or 0) / 100
-    rub_str = f'{rub:g}'.replace('.', ',')
-    return f'{rub_str} ₽'
-
-
 def _format_referral_purchase_amount(order: Dict[str, Any], event: Dict[str, Any]) -> str:
     """Formats the referral purchase amount by the actual payment type."""
-    payment_type = event.get('payment_type') or order.get('payment_type', '')
-    amount_raw = event.get('amount_raw') or 0
+    from bot.services.money import format_money_minor
 
-    if event.get('amount_base_minor') is not None:
-        from bot.services.money import format_money_minor
-
-        return format_money_minor(
-            event.get('amount_base_minor') or 0,
-            event.get('base_currency') or order.get('base_currency') or 'RUB',
-        )
-
-    if payment_type == 'crypto':
-        usd = amount_raw / 100
-        usd_str = f'{usd:g}'.replace('.', ',')
-        return f'${usd_str} USDT'
-
-    if payment_type == 'stars':
-        return f'{amount_raw} ⭐'
-
-    if amount_raw:
-        return _format_rub_cents(amount_raw)
-
-    price_rub = order.get('price_rub', 0) or 0
-    return f'{price_rub:g}'.replace('.', ',') + ' ₽' if price_rub else '—'
+    return format_money_minor(
+        event.get('amount_base_minor') or 0,
+        event.get('base_currency') or order.get('base_currency') or 'RUB',
+    )
 
 
 def _format_referral_reward(event: Dict[str, Any]) -> str:
@@ -338,7 +282,6 @@ async def notify_referrers_purchase(
             tariff = get_tariff_by_id(tariff_id)
             if tariff:
                 tariff_name = tariff.get('name') or tariff_name
-                order.setdefault('price_rub', tariff.get('price_rub', 0) or 0)
 
         for event in referral_events:
             level = event.get('level')
@@ -412,14 +355,6 @@ async def notify_admins_payment(bot: Bot, order: Dict[str, Any]) -> None:
         # Tariff data
         tariff_name = order.get('tariff_name', '—')
 
-        # We pull up price_rub from the tariff (the order does not have this field)
-        tariff_id = order.get('tariff_id')
-        if tariff_id:
-            from database.requests import get_tariff_by_id
-            tariff = get_tariff_by_id(tariff_id)
-            if tariff:
-                order['price_rub'] = tariff.get('price_rub', 0)
-
         # Server data (from the key, if linked)
         server_name = 'Не выбран'
         vpn_key_id = order.get('vpn_key_id')
@@ -436,7 +371,7 @@ async def notify_admins_payment(bot: Bot, order: Dict[str, Any]) -> None:
         amount_str = _format_payment_amount(order)
 
         # Action
-        action = _get_payment_action(order)
+        action = _get_payment_notification_kind(order)
 
         # Title - depends on the action
         if action == 'trial':
@@ -445,8 +380,10 @@ async def notify_admins_payment(bot: Bot, order: Dict[str, Any]) -> None:
             header = '🔄 <b>Продление</b>'
         elif action == 'balance_topup':
             header = '💰 <b>Пополнение баланса</b>'
-        else:
+        elif action == 'new_key':
             header = '💰 <b>Новая покупка</b>'
+        else:
+            header = '💳 <b>Платёж</b>'
 
         # Forming the text
         lines = [header + '\n']
@@ -467,9 +404,7 @@ async def notify_admins_payment(bot: Bot, order: Dict[str, Any]) -> None:
             from bot.services.money import format_money_minor
 
             nominal = int(
-                order.get('nominal_amount_minor')
-                or order.get('nominal_amount_cents')
-                or 0
+                order.get('nominal_amount_minor') or 0
             )
             lines.append(
                 f"💎 Зачислено: {format_money_minor(nominal, order.get('base_currency') or 'RUB')}"

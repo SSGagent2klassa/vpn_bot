@@ -24,21 +24,117 @@ from database.requests import (
     get_tariffs_by_group,
     get_active_servers_by_group,
     toggle_group_monthly_traffic_reset,
+    set_group_subscription_parent,
 )
 from bot.states.admin_states import AdminStates
 from bot.utils.admin import is_admin
 from bot.keyboards.admin import (
     groups_list_kb,
     group_view_kb,
+    group_subscription_parent_kb,
     group_delete_confirm_kb,
     back_and_home_kb
 )
+from bot.utils.text import escape_html, safe_edit_or_send
 
 logger = logging.getLogger(__name__)
 
-from bot.utils.text import safe_edit_or_send
-
 router = Router()
+
+
+def _group_subscription_parent_id(group: dict) -> int | None:
+    """Return the optional subscription host group id from a DB row."""
+    value = group.get('subscription_parent_group_id')
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _group_subscription_parent_name(group: dict, groups: list[dict]) -> str | None:
+    parent_id = _group_subscription_parent_id(group)
+    if parent_id is None:
+        return None
+    for candidate in groups:
+        if int(candidate['id']) == parent_id:
+            return str(candidate.get('name') or parent_id)
+    return str(parent_id)
+
+
+def _build_group_view_text(
+    group: dict,
+    tariffs: list[dict],
+    servers: list[dict],
+    groups: list[dict],
+    *,
+    notice: str | None = None,
+) -> str:
+    """Build the administrator group card from current database state."""
+    from bot.services.money import format_money_minor
+
+    group_id = int(group['id'])
+    is_default = " <i>(по умолчанию)</i>" if group_id == 1 else ""
+    parent_name = _group_subscription_parent_name(group, groups)
+    parent_text = (
+        escape_html(parent_name)
+        if parent_name is not None
+        else "нет"
+    )
+    text = ""
+    if notice:
+        text += f"{notice}\n\n"
+    text += (
+        f"📂 <b>{escape_html(str(group.get('name') or group_id))}</b>{is_default}\n\n"
+        f"🔢 Порядок: {int(group.get('sort_order') or 0)}\n"
+        f"📋 Активных тарифов: {len(tariffs)}\n"
+        f"🖥️ Активных серверов: {len(servers)}\n"
+        f"🔄 Автосброс 1-го числа: "
+        f"{'включён' if group.get('monthly_traffic_reset_enabled') else 'выключен'}\n"
+        f"🔗 Привязывать к подписке из группы: <b>{parent_text}</b>\n"
+    )
+    if tariffs:
+        text += "\n<b>Тарифы:</b>\n"
+        for tariff in tariffs:
+            text += (
+                f"  • {escape_html(str(tariff.get('name') or tariff['id']))} — "
+                f"{format_money_minor(tariff.get('price_minor', 0), tariff.get('base_currency', 'RUB'))}\n"
+            )
+    if servers:
+        text += "\n<b>Серверы:</b>\n"
+        for server in servers:
+            text += f"  • {escape_html(str(server.get('name') or server['id']))}\n"
+    return text
+
+
+async def _render_group_view(
+    callback: CallbackQuery,
+    group_id: int,
+    *,
+    notice: str | None = None,
+) -> bool:
+    group = get_group_by_id(group_id)
+    if not group:
+        return False
+    tariffs = get_tariffs_by_group(group_id)
+    servers = get_active_servers_by_group(group_id)
+    await safe_edit_or_send(
+        callback.message,
+        _build_group_view_text(
+            group,
+            tariffs,
+            servers,
+            get_all_groups(),
+            notice=notice,
+        ),
+        reply_markup=group_view_kb(
+            group_id,
+            bool(group.get('monthly_traffic_reset_enabled')),
+        ),
+    )
+    return True
 
 
 # ============================================================================
@@ -80,8 +176,8 @@ async def show_groups_list(callback: CallbackQuery, state: FSMContext):
         )
     
     for g in groups_info:
-        is_default = " _(по умолчанию)_" if g['id'] == 1 else ""
-        text += f"\n📂 <b>{g['name']}</b>{is_default}\n"
+        is_default = " <i>(по умолчанию)</i>" if g['id'] == 1 else ""
+        text += f"\n📂 <b>{escape_html(str(g['name']))}</b>{is_default}\n"
         text += f"   Тарифов: {g['tariffs_count']} | Серверов: {g['servers_count']}\n"
         reset_text = "включён" if g['monthly_traffic_reset_enabled'] else "выключен"
         text += f"   Автосброс: {reset_text}\n"
@@ -207,48 +303,127 @@ async def group_view_handler(callback: CallbackQuery, state: FSMContext):
         return
     
     group_id = int(callback.data.split(":")[1])
+    if not await _render_group_view(callback, group_id):
+        await callback.answer("❌ Группа не найдена", show_alert=True)
+        return
+    await state.set_state(AdminStates.payments_menu)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('admin_group_parent:'))
+async def group_subscription_parent_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """Open the optional subscription host group selector."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    try:
+        group_id = int(str(callback.data).split(':', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback.answer("❌ Группа не найдена", show_alert=True)
+        return
     group = get_group_by_id(group_id)
-    
     if not group:
         await callback.answer("❌ Группа не найдена", show_alert=True)
         return
-    
-    tariffs = get_tariffs_by_group(group_id)
-    servers = get_active_servers_by_group(group_id)
-    
-    is_default = " _(по умолчанию)_" if group_id == 1 else ""
-    
-    text = (
-        f"📂 <b>{group['name']}</b>{is_default}\n\n"
-        f"🔢 Порядок: {group['sort_order']}\n"
-        f"📋 Активных тарифов: {len(tariffs)}\n"
-        f"🖥️ Активных серверов: {len(servers)}\n"
-        f"🔄 Автосброс 1-го числа: "
-        f"{'включён' if group['monthly_traffic_reset_enabled'] else 'выключен'}\n"
-    )
-    
-    if tariffs:
-        text += "\n<b>Тарифы:</b>\n"
-        for t in tariffs:
-            from bot.services.money import format_money_minor
 
-            text += (
-                f"  • {t['name']} — "
-                f"{format_money_minor(t.get('price_minor', 0), t.get('base_currency', 'RUB'))}\n"
-            )
-    
-    if servers:
-        text += "\n<b>Серверы:</b>\n"
-        for s in servers:
-            text += f"  • {s['name']}\n"
-    
-    await safe_edit_or_send(callback.message, 
-        text,
-        reply_markup=group_view_kb(
-            group_id,
-            bool(group['monthly_traffic_reset_enabled']),
-        )
+    groups = get_all_groups()
+    candidates = [
+        candidate
+        for candidate in groups
+        if int(candidate['id']) != group_id
+    ]
+    current_parent_id = _group_subscription_parent_id(group)
+    current_parent_name = _group_subscription_parent_name(group, groups)
+    current_text = (
+        f"<b>{escape_html(current_parent_name)}</b>"
+        if current_parent_name is not None
+        else "<b>не настроено</b>"
     )
+    text = (
+        "🔗 <b>Привязка к подписке</b>\n\n"
+        f"Группа ключа: <b>{escape_html(str(group.get('name') or group_id))}</b>\n"
+        f"Искать подписку в группе: {current_text}\n\n"
+        "После покупки ключа из этой группы бот ищет у пользователя подходящие "
+        "активные подписки в выбранной группе. Если подписка одна, ключ привязывается "
+        "автоматически; если несколько — бот предложит пользователю выбрать. Если "
+        "подходящей подписки нет, покупка всё равно завершится, а ключ останется "
+        "отдельным.\n\n"
+        "⚠️ Подписка для привязки должна находиться на сервере с 3X-UI 3.4.0 "
+        "или новее; ключи на 3.3.x не участвуют в автоматическом выборе.\n\n"
+        "Выберите группу, в которой бот будет искать подписку для привязки:"
+    )
+
+    await state.set_state(AdminStates.group_subscription_parent)
+    await state.update_data(subscription_parent_group_id=group_id)
+    await safe_edit_or_send(
+        callback.message,
+        text,
+        reply_markup=group_subscription_parent_kb(
+            candidates,
+            current_parent_group_id=current_parent_id,
+            back_callback=f'admin_group_view:{group_id}',
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminStates.group_subscription_parent,
+    F.data.startswith('admin_group_parent_set:'),
+)
+async def group_subscription_parent_set(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """Persist the selected subscription host group through the DB facade."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    data = await state.get_data()
+    try:
+        group_id = int(data.get('subscription_parent_group_id') or 0)
+        selected_id = int(str(callback.data).rsplit(':', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback.answer("❌ Некорректный выбор", show_alert=True)
+        return
+    parent_group_id = selected_id if selected_id > 0 else None
+    if group_id <= 0 or not get_group_by_id(group_id):
+        await state.set_state(AdminStates.payments_menu)
+        await callback.answer("❌ Группа не найдена", show_alert=True)
+        return
+
+    try:
+        success = set_group_subscription_parent(
+            group_id=group_id,
+            parent_group_id=parent_group_id,
+        )
+    except ValueError as error:
+        logger.warning(
+            'Rejected subscription parent group=%s parent=%s: %s',
+            group_id,
+            parent_group_id,
+            error,
+        )
+        success = False
+    if not success:
+        await callback.answer(
+            "❌ Нельзя создать такую связь между группами",
+            show_alert=True,
+        )
+        return
+
+    await state.set_state(AdminStates.payments_menu)
+    notice = (
+        "✅ Привязка к подписке настроена"
+        if parent_group_id is not None
+        else "✅ Привязка к подписке отключена"
+    )
+    if not await _render_group_view(callback, group_id, notice=notice):
+        await callback.answer("❌ Группа не найдена", show_alert=True)
+        return
     await callback.answer()
 
 
@@ -271,7 +446,7 @@ async def group_edit_start(callback: CallbackQuery, state: FSMContext):
     
     await safe_edit_or_send(callback.message, 
         f"✏️ <b>Переименование группы</b>\n\n"
-        f"Текущее название: <b>{group['name']}</b>\n\n"
+        f"Текущее название: <b>{escape_html(str(group['name']))}</b>\n\n"
         "Введите новое название (макс. 30 символов):",
         reply_markup=back_and_home_kb(f"admin_group_view:{group_id}")
     )
@@ -317,14 +492,12 @@ async def group_edit_name_handler(message: Message, state: FSMContext):
         tariffs = get_tariffs_by_group(group_id)
         servers = get_active_servers_by_group(group_id)
         
-        is_default = " _(по умолчанию)_" if group_id == 1 else ""
-        
-        text = (
-            f"✅ Группа переименована!\n\n"
-            f"📂 <b>{group['name']}</b>{is_default}\n\n"
-            f"🔢 Порядок: {group['sort_order']}\n"
-            f"📋 Активных тарифов: {len(tariffs)}\n"
-            f"🖥️ Активных серверов: {len(servers)}\n"
+        text = _build_group_view_text(
+            group,
+            tariffs,
+            servers,
+            get_all_groups(),
+            notice="✅ Группа переименована!",
         )
         
         try:
@@ -348,7 +521,10 @@ async def group_edit_name_handler(message: Message, state: FSMContext):
                 force_new=True,
             )
     else:
-        await safe_edit_or_send(message, f"✅ Группа переименована в <b>{name}</b>")
+        await safe_edit_or_send(
+            message,
+            f"✅ Группа переименована в <b>{escape_html(name)}</b>",
+        )
 
 
 # ============================================================================

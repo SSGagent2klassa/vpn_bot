@@ -10,6 +10,7 @@ from .extension_callbacks import router as extension_callbacks_router
 from .extension_commands import router as extension_commands_router
 from .support import router as support_router
 from .promo import router as promo_router
+from .subscription_hosts import router as subscription_hosts_router
 
 # These are packages/modules that were explicitly standalone
 from .referral import router as referral_router
@@ -33,6 +34,7 @@ router.include_router(page_routes_router)
 router.include_router(start_router)
 router.include_router(extension_commands_router)
 router.include_router(custom_pages_router)
+router.include_router(subscription_hosts_router)
 router.include_router(keys_router)
 router.include_router(trial_router)
 router.include_router(tariffs_router)

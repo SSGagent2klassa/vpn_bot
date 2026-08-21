@@ -8,11 +8,8 @@ from .admin_misc import back_button, home_button, cancel_button
 def _tariff_price_text(tariff: Dict[str, Any]) -> str:
     from bot.services.money import format_money_minor
 
-    price_minor = tariff.get('price_minor')
-    if price_minor is None:
-        price_minor = int(float(tariff.get('price_rub') or 0) * 100)
     return format_money_minor(
-        price_minor,
+        int(tariff.get('price_minor') or 0),
         tariff.get('base_currency') or 'RUB',
     )
 

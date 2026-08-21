@@ -88,6 +88,7 @@ async def _fulfill_payment_intent_unlocked(
             message='payment_processing',
         )
 
+    completion_key_id: int | None = None
     try:
         initial_order = find_order_by_order_id(intent.order_id)
         if not initial_order:
@@ -96,6 +97,19 @@ async def _fulfill_payment_intent_unlocked(
         purpose_result = await _apply_purpose(intent)
         if not purpose_result.get('ok'):
             raise RuntimeError(str(purpose_result.get('reason') or 'purpose fulfillment failed'))
+        if intent.purpose == PURPOSE_KEY_PURCHASE:
+            key_id = int(purpose_result.get('key_id') or intent.vpn_key_id or 0)
+            if key_id <= 0:
+                raise RuntimeError('Key purchase fulfillment returned no key id')
+            completion_key_id = key_id
+            from bot.services.extension_completion import (
+                ensure_payment_origin_completion_job,
+            )
+
+            ensure_payment_origin_completion_job(
+                intent.order_id,
+                key_id=key_id,
+            )
 
         order = find_order_by_order_id(intent.order_id)
         if not order:
@@ -113,6 +127,26 @@ async def _fulfill_payment_intent_unlocked(
             if not current or current.fulfillment_status != 'completed':
                 raise RuntimeError('Payment fulfillment could not be finalized')
 
+        if completion_key_id is not None:
+            try:
+                from bot.services.extension_completion import (
+                    promote_payment_origin_completion_after_fulfillment,
+                )
+
+                promote_payment_origin_completion_after_fulfillment(
+                    intent.order_id,
+                    key_id=completion_key_id,
+                )
+            except Exception as error:
+                # The periodic durable promoter closes a crash or transient-error
+                # window without weakening financial finality.
+                logger.warning(
+                    'Payment origin completion wakeup deferred order=%s key=%s: %s',
+                    intent.order_id,
+                    completion_key_id,
+                    error,
+                )
+
         completed = load_payment_intent(intent.order_id)
         if completed is None:
             raise RuntimeError('Completed payment intent cannot be loaded')
@@ -124,7 +158,6 @@ async def _fulfill_payment_intent_unlocked(
                 'vpn_key_id': int(purpose_result.get('key_id') or 0) or result.vpn_key_id,
                 'credited_amount_minor': int(
                     purpose_result.get('credited_amount_minor')
-                    or purpose_result.get('credited_amount_cents')
                     or 0
                 ),
             }
@@ -206,7 +239,7 @@ async def _apply_promotion_once(order: dict[str, Any]) -> None:
 
 
 async def _debit_internal_balance_once(order: dict[str, Any]) -> None:
-    amount = int(order.get('balance_deduct_cents') or 0)
+    amount = int(order.get('balance_deduct_minor') or 0)
     if amount <= 0:
         return
 
@@ -222,7 +255,7 @@ async def _debit_internal_balance_once(order: dict[str, Any]) -> None:
             reference_type='payment_order',
             reference_id=reference,
         ):
-            return {'amount_cents': amount, 'already_applied': True}
+            return {'amount_minor': amount, 'already_applied': True}
         result = await debit_user_balance(
             int(order['user_id']),
             amount,
@@ -234,7 +267,7 @@ async def _debit_internal_balance_once(order: dict[str, Any]) -> None:
         )
         if not result.get('ok'):
             raise RuntimeError(f"Balance debit failed: {result.get('status')}")
-        return {'amount_cents': amount, 'operation_id': result.get('operation_id')}
+        return {'amount_minor': amount, 'operation_id': result.get('operation_id')}
 
     await _run_effect(order['order_id'], 'balance_debit', apply)
 
@@ -254,10 +287,10 @@ async def _apply_referrals_once(order: dict[str, Any], *, bot: Any) -> None:
         events = await process_referral_reward(
             int(order['user_id']),
             resolve_duration_days(order, fallback=0),
-            int(order.get('payable_amount_cents') or 0),
+            int(order.get('payable_amount_minor') or 0),
             str(order.get('payment_type') or ''),
-            bot=bot,
             order=order,
+            bot=bot,
         )
         return {'events': events}
 

@@ -8,11 +8,15 @@ from aiogram.fsm.context import FSMContext
 from config import ADMIN_IDS
 from database.requests import get_users_stats, get_all_users_paginated, get_user_by_telegram_id, toggle_user_ban, get_user_vpn_keys, get_user_payments_stats, get_vpn_key_by_id, create_vpn_key_admin, get_user_balance, get_user_referral_coefficient, add_to_balance, deduct_from_balance, set_user_referral_coefficient
 from bot.utils.admin import is_admin
+from bot.utils.admin_dialog import (
+    render_admin_dialog,
+    render_admin_dialog_from_input,
+)
 from bot.utils.datetime_format import format_datetime_for_display
 from bot.utils.text import escape_html, safe_edit_or_send
 from bot.utils.panel_email import get_panel_email_prefix
 from bot.states.admin_states import AdminStates
-from bot.keyboards.admin import users_menu_kb, users_list_kb, user_view_kb, user_ban_confirm_kb, key_view_kb, add_key_group_kb, add_key_server_kb, add_key_step_kb, add_key_confirm_kb, users_input_cancel_kb, key_action_cancel_kb, back_and_home_kb, home_only_kb
+from bot.keyboards.admin import users_menu_kb, users_list_kb, user_view_kb, user_ban_confirm_kb, key_view_kb, add_key_group_kb, add_key_server_kb, add_key_step_kb, add_key_confirm_kb, users_input_cancel_kb, key_action_cancel_kb, key_action_back_kb, back_and_home_kb, home_only_kb
 from bot.services.vpn_api import (
     get_client_from_server_data,
     get_client_inbound_descriptors,
@@ -120,26 +124,12 @@ async def show_key_view(callback: CallbackQuery, state: FSMContext):
                 else:
                     text += f'• <code>{dt}</code>: {reason_safe}\n'
                 continue
-            amount = ''
-            if int(p.get('intent_version') or 0) == 1:
-                from bot.services.money import format_money_minor
+            from bot.services.money import format_money_minor
 
-                amount = format_money_minor(
-                    p.get('payable_amount_minor') or p.get('payable_amount_cents') or 0,
-                    p.get('base_currency') or 'RUB',
-                )
-            elif p.get('payment_type') == 'crypto':
-                usd = p['amount_cents'] / 100
-                usd_str = f'{usd:g}'.replace('.', ',')
-                amount = f'${usd_str}'
-            elif p.get('payment_type') == 'stars':
-                amount = f"{p['amount_stars']} ⭐"
-            elif p.get('payment_type') in ('cards', 'yookassa_qr', 'wata', 'platega', 'cardlink', 'balance'):
-                rub = p.get('price_rub') or 0
-                rub_str = f'{rub:g}'.replace('.', ',')
-                amount = f'{rub_str} ₽'
-            else:
-                amount = '?'
+            amount = format_money_minor(
+                p.get('payable_amount_minor') or 0,
+                p.get('base_currency') or 'RUB',
+            )
             tariff_safe = escape_html(p['tariff_name'] or 'Неизвестно')
             text += f'• <code>{dt}</code>: {amount} — {tariff_safe}\n'
     else:
@@ -157,7 +147,15 @@ async def start_key_extend(callback: CallbackQuery, state: FSMContext):
     key_id = int(callback.data.split(':')[1])
     await state.set_state(AdminStates.key_extend_days)
     await state.update_data(current_key_id=key_id)
-    await safe_edit_or_send(callback.message, '📅 <b>Изменение срока действия ключа</b>\n\nВведите количество дней. Отрицательное число уменьшает конечный срок, 0 делает ключ бессрочным. Добавление дней к уже бессрочному ключу не снимает бессрочность.', reply_markup=key_action_cancel_kb(key_id, 0))
+    await render_admin_dialog(
+        callback.message,
+        state,
+        '📅 <b>Изменение срока действия ключа</b>\n\n'
+        'Введите количество дней. Отрицательное число уменьшает конечный срок, '
+        '0 делает ключ бессрочным. Добавление дней к уже бессрочному ключу не '
+        'снимает бессрочность.',
+        reply_markup=key_action_back_kb(key_id),
+    )
     await callback.answer()
 
 @router.message(AdminStates.key_extend_days, F.text, ~F.text.startswith('/'))
@@ -166,32 +164,80 @@ async def process_key_extend(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     from bot.utils.text import get_message_text_for_storage
-    text = get_message_text_for_storage(message, 'plain')
-    if not text.lstrip('-').isdigit() or int(text) < -99999 or int(text) > 99999:
-        await safe_edit_or_send(message, '❌ Введите число от -99999 до 99999')
-        return
-    days = int(text)
+    text = get_message_text_for_storage(message, 'plain').strip()
     data = await state.get_data()
     key_id = data.get('current_key_id')
+    if not text.lstrip('-').isdigit() or int(text) < -99999 or int(text) > 99999:
+        await render_admin_dialog_from_input(
+            message,
+            state,
+            '📅 <b>Изменение срока действия ключа</b>\n\n'
+            '❌ Введите целое число от -99999 до 99999.\n\n'
+            'Отрицательное число уменьшает конечный срок, 0 делает ключ '
+            'бессрочным. Добавление дней к уже бессрочному ключу не снимает '
+            'бессрочность.',
+            reply_markup=key_action_back_kb(key_id),
+        )
+        return
+    days = int(text)
+    previous_key = get_vpn_key_by_id(key_id)
+    target = await render_admin_dialog_from_input(
+        message,
+        state,
+        '⏳ <b>Изменение срока действия ключа</b>\n\nПрименяю новое значение…',
+        reply_markup=key_action_back_kb(key_id),
+    )
     from bot.services.key_lifecycle import renew_key_access
-    result = await renew_key_access(key_id, days, reset_traffic=True)
+    result = await renew_key_access(key_id, days)
     if result['db_updated']:
         updated_key = get_vpn_key_by_id(key_id)
-        if days == 0:
-            result_text = '✅ Ключ переведён в режим «Без срока»!'
-        elif updated_key and updated_key.get('expires_at') is None:
-            result_text = '✅ Ключ уже бессрочный; начисление дней не ограничило его срок.'
+        was_perpetual = bool(previous_key and previous_key.get('expires_at') is None)
+        is_perpetual = bool(updated_key and updated_key.get('expires_at') is None)
+        if is_perpetual and was_perpetual:
+            result_text = (
+                '✅ <b>Срок ключа не изменён</b>\n\n'
+                'Ключ уже работал без ограничения по сроку.'
+            )
+        elif is_perpetual:
+            result_text = (
+                '✅ <b>Срок ключа обновлён</b>\n\n'
+                'Ключ переведён в режим «Без срока».'
+            )
         else:
             action_text = f'уменьшен на {abs(days)}' if days < 0 else f'продлён на {days}'
-            result_text = f'✅ Срок действия ключа {action_text} дней!'
+            result_text = (
+                '✅ <b>Срок ключа обновлён</b>\n\n'
+                f'Срок действия {action_text} дней.'
+            )
+        current_expiry = (
+            'Без срока'
+            if is_perpetual
+            else format_datetime_for_display(
+                updated_key.get('expires_at') if updated_key else None,
+                fallback='неизвестен',
+            )
+        )
+        result_text += (
+            f'\n\n⏰ Текущий срок: <b>{escape_html(current_expiry)}</b>'
+        )
         if not result['panel_synced']:
             result_text += '\n\n⚠️ БД обновлена, но панель синхронизирована не полностью. Повторная синхронизация сможет дожать состояние.'
-        await safe_edit_or_send(message, result_text, force_new=True)
-        key = get_vpn_key_by_id(key_id)
-        if key:
+        await render_admin_dialog(
+            target,
+            state,
+            result_text,
+            reply_markup=key_action_back_kb(key_id),
+        )
+        if updated_key:
             await state.set_state(AdminStates.key_view)
     else:
-        await safe_edit_or_send(message, '❌ Ошибка продления ключа')
+        await render_admin_dialog(
+            target,
+            state,
+            '❌ <b>Срок ключа не изменён</b>\n\n'
+            'Не удалось сохранить новое значение. Попробуйте ещё раз.',
+            reply_markup=key_action_back_kb(key_id),
+        )
 
 @router.callback_query(F.data.startswith('admin_key_reset_traffic:'))
 @regular_panel_operation

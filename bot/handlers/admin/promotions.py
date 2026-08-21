@@ -12,6 +12,10 @@ from bot.keyboards.admin import (
 )
 from bot.states.admin_states import AdminStates
 from bot.utils.admin import is_admin
+from bot.utils.admin_dialog import (
+    render_admin_dialog,
+    render_admin_dialog_from_input,
+)
 from bot.utils.telegram_links import build_telegram_link, get_telegram_link_domain
 from bot.utils.text import escape_html, get_message_text_for_storage, safe_edit_or_send
 from database.requests import (
@@ -38,6 +42,19 @@ def _parse_expires(value: str):
         return None
     dt = datetime.datetime.strptime(value, "%Y-%m-%d")
     return dt.replace(hour=23, minute=59, second=59)
+
+
+def _promocode_add_prompt(
+    title: str,
+    prompt: str,
+    *,
+    error: str | None = None,
+) -> str:
+    parts = [title]
+    if error:
+        parts.append(f"❌ {error}")
+    parts.append(prompt)
+    return "\n\n".join(parts)
 
 
 async def _delete_input(message: Message) -> None:
@@ -93,9 +110,14 @@ async def admin_promocode_add(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     await state.set_state(AdminStates.promocode_add_code)
-    await safe_edit_or_send(
+    await render_admin_dialog(
         callback.message,
-        "➕ <b>Новый промокод</b>\n\nВведите имя промокода. Можно использовать только <code>0-9</code>, <code>A-Z</code>, <code>a-z</code>.",
+        state,
+        _promocode_add_prompt(
+            "➕ <b>Новый промокод</b>",
+            "Введите имя промокода. Можно использовать только <code>0-9</code>, "
+            "<code>A-Z</code>, <code>a-z</code>.",
+        ),
         reply_markup=promotion_cancel_kb("admin_promocodes"),
     )
     await callback.answer()
@@ -103,60 +125,129 @@ async def admin_promocode_add(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminStates.promocode_add_code, F.text, ~F.text.startswith("/"))
 async def promocode_add_code(message: Message, state: FSMContext):
-    await _delete_input(message)
     code = get_message_text_for_storage(message, "plain").strip()
     if not is_base62_code(code):
-        await safe_edit_or_send(message, "❌ Код должен быть в base62: <code>0-9</code>, <code>A-Z</code>, <code>a-z</code>.", reply_markup=promotion_cancel_kb("admin_promocodes"), force_new=True)
+        await render_admin_dialog_from_input(
+            message,
+            state,
+            _promocode_add_prompt(
+                "➕ <b>Новый промокод</b>",
+                "Введите имя промокода. Можно использовать только <code>0-9</code>, "
+                "<code>A-Z</code>, <code>a-z</code>.",
+                error=(
+                    "Код должен быть в base62: <code>0-9</code>, "
+                    "<code>A-Z</code>, <code>a-z</code>."
+                ),
+            ),
+            reply_markup=promotion_cancel_kb("admin_promocodes"),
+        )
         return
     if get_promo_code_by_code(code):
-        await safe_edit_or_send(message, "❌ Такой код уже существует. Введите другой код.", reply_markup=promotion_cancel_kb("admin_promocodes"), force_new=True)
+        await render_admin_dialog_from_input(
+            message,
+            state,
+            _promocode_add_prompt(
+                "➕ <b>Новый промокод</b>",
+                "Введите другое имя промокода.",
+                error="Такой код уже существует.",
+            ),
+            reply_markup=promotion_cancel_kb("admin_promocodes"),
+        )
         return
     await state.update_data(promocode_code=code)
     await state.set_state(AdminStates.promocode_add_discount)
-    await safe_edit_or_send(message, "📊 <b>Скидка</b>\n\nВведите размер скидки от 0 до 100%.", reply_markup=promotion_cancel_kb("admin_promocodes"), force_new=True)
+    await render_admin_dialog_from_input(
+        message,
+        state,
+        _promocode_add_prompt(
+            "📊 <b>Скидка</b>",
+            "Введите размер скидки от 0 до 100%.",
+        ),
+        reply_markup=promotion_cancel_kb("admin_promocodes"),
+    )
 
 
 @router.message(AdminStates.promocode_add_discount, F.text, ~F.text.startswith("/"))
 async def promocode_add_discount(message: Message, state: FSMContext):
-    await _delete_input(message)
     value = get_message_text_for_storage(message, "plain").strip()
     if not value.isdigit() or not 0 <= int(value) <= 100:
-        await safe_edit_or_send(message, "❌ Введите число от 0 до 100.", reply_markup=promotion_cancel_kb("admin_promocodes"), force_new=True)
+        await render_admin_dialog_from_input(
+            message,
+            state,
+            _promocode_add_prompt(
+                "📊 <b>Скидка</b>",
+                "Введите размер скидки от 0 до 100%.",
+                error="Введите целое число от 0 до 100.",
+            ),
+            reply_markup=promotion_cancel_kb("admin_promocodes"),
+        )
         return
     await state.update_data(promocode_discount=int(value))
     await state.set_state(AdminStates.promocode_add_expires)
-    await safe_edit_or_send(message, "⏳ <b>Срок действия</b>\n\nВведите дату в формате <code>YYYY-MM-DD</code> или <code>0</code>, если срок не ограничен.", reply_markup=promotion_cancel_kb("admin_promocodes"), force_new=True)
+    await render_admin_dialog_from_input(
+        message,
+        state,
+        _promocode_add_prompt(
+            "⏳ <b>Срок действия</b>",
+            "Введите дату в формате <code>YYYY-MM-DD</code> или <code>0</code>, "
+            "если срок не ограничен.",
+        ),
+        reply_markup=promotion_cancel_kb("admin_promocodes"),
+    )
 
 
 @router.message(AdminStates.promocode_add_expires, F.text, ~F.text.startswith("/"))
 async def promocode_add_expires(message: Message, state: FSMContext):
-    await _delete_input(message)
     raw = get_message_text_for_storage(message, "plain").strip()
     try:
         expires_at = _parse_expires(raw)
     except ValueError:
-        await safe_edit_or_send(message, "❌ Неверная дата. Введите <code>YYYY-MM-DD</code> или <code>0</code>.", reply_markup=promotion_cancel_kb("admin_promocodes"), force_new=True)
+        await render_admin_dialog_from_input(
+            message,
+            state,
+            _promocode_add_prompt(
+                "⏳ <b>Срок действия</b>",
+                "Введите дату в формате <code>YYYY-MM-DD</code> или <code>0</code>, "
+                "если срок не ограничен.",
+                error="Неверная дата.",
+            ),
+            reply_markup=promotion_cancel_kb("admin_promocodes"),
+        )
         return
     await state.update_data(promocode_expires=expires_at)
     await state.set_state(AdminStates.promocode_add_limit)
-    await safe_edit_or_send(
+    await render_admin_dialog_from_input(
         message,
+        state,
         "🔢 <b>Лимит активаций</b>\n\n"
         "Введите общее количество применений разными пользователями или <code>0</code> без общего лимита. "
         "Один пользователь в любом случае может применить этот промокод только один раз.",
         reply_markup=promotion_cancel_kb("admin_promocodes"),
-        force_new=True,
     )
 
 
 @router.message(AdminStates.promocode_add_limit, F.text, ~F.text.startswith("/"))
 async def promocode_add_limit(message: Message, state: FSMContext):
-    await _delete_input(message)
     raw = get_message_text_for_storage(message, "plain").strip()
     if not raw.isdigit():
-        await safe_edit_or_send(message, "❌ Введите целое число.", reply_markup=promotion_cancel_kb("admin_promocodes"), force_new=True)
+        await render_admin_dialog_from_input(
+            message,
+            state,
+            _promocode_add_prompt(
+                "🔢 <b>Лимит активаций</b>",
+                "Введите общее количество применений разными пользователями или "
+                "<code>0</code> без общего лимита.",
+                error="Введите целое неотрицательное число.",
+            ),
+            reply_markup=promotion_cancel_kb("admin_promocodes"),
+        )
         return
     data = await state.get_data()
+    target = await render_admin_dialog_from_input(
+        message,
+        state,
+        "⏳ <b>Создание промокода</b>\n\nСохраняю введённые параметры…",
+    )
     promo_id = create_promo_code(
         code=data["promocode_code"],
         discount_percent=data["promocode_discount"],
@@ -166,10 +257,17 @@ async def promocode_add_limit(message: Message, state: FSMContext):
         source="admin",
         code_type="promo",
     )
-    await state.clear()
-    promo = get_promo_code_by_id(promo_id)
-    bot_info = await message.bot.get_me()
-    await safe_edit_or_send(message, _promocode_text(promo, bot_info.username), reply_markup=promocode_detail_kb(promo), force_new=True)
+    try:
+        promo = get_promo_code_by_id(promo_id)
+        bot_info = await message.bot.get_me()
+        await render_admin_dialog(
+            target,
+            state,
+            _promocode_text(promo, bot_info.username),
+            reply_markup=promocode_detail_kb(promo),
+        )
+    finally:
+        await state.clear()
 
 @router.callback_query(F.data.startswith("admin_promocode_view:"))
 async def admin_promocode_view(callback: CallbackQuery, state: FSMContext):

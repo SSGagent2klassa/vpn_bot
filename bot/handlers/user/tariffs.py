@@ -30,7 +30,7 @@ async def cmd_buy(message: Message, state: FSMContext | None = None):
     )
 
 
-async def _render_buy_page(target):
+async def _render_buy_page(target, *, action_context_token: str | None = None):
     """Renders the key purchase page.
 
     Args:
@@ -86,6 +86,7 @@ async def _render_buy_page(target):
             tariffs,
             'key_purchase',
             user_id=get_user_internal_id(telegram_id),
+            action_context_token=action_context_token,
         ),
         'tariff_back_callback': 'start',
     }
@@ -118,7 +119,43 @@ async def _execute_purchase_start(request: CoreActionRequest) -> None:
         if isinstance(request.target, CallbackQuery):
             await request.target.answer()
         return
-    await _render_buy_page(request.target)
+    action_context_token = None
+    if request.origin_context is not None:
+        from database.requests import (
+            create_semantic_action_context,
+            get_or_create_user,
+        )
+
+        telegram_user = request.target.from_user
+        user, _ = get_or_create_user(
+            telegram_user.id,
+            telegram_user.username,
+            telegram_user.first_name,
+            telegram_user.last_name,
+        )
+        action_context_token = create_semantic_action_context(
+            user_id=int(user['id']),
+            action=request.action,
+            **request.origin_context.as_storage_dict(),
+        )
+
+    tariff_id = request.params.get('tariff_id')
+    if tariff_id is not None:
+        from bot.handlers.user.payments.intent import start_tariff_payment_intent
+
+        await start_tariff_payment_intent(
+            request.target,
+            request.state,
+            purpose='key_purchase',
+            tariff_id=int(tariff_id),
+            origin_context_token=action_context_token,
+        )
+        return
+
+    await _render_buy_page(
+        request.target,
+        action_context_token=action_context_token,
+    )
     if isinstance(request.target, CallbackQuery):
         await request.target.answer()
 

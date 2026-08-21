@@ -7,6 +7,7 @@ from typing import Any, Sequence
 
 
 MINIMUM_SUPPORTED_3X_UI_VERSION = (3, 3, 0)
+CLIENT_EXTERNAL_LINKS_MIN_VERSION = (3, 4, 0)
 _VERSION_PART_RE = re.compile(r"(\d+)")
 
 

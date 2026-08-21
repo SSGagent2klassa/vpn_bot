@@ -1,5 +1,4 @@
 import logging
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, Optional
 
 from bot.services.exchange_rate import (
@@ -25,7 +24,6 @@ from database.requests import (
 logger = logging.getLogger(__name__)
 
 RUB_PAYMENT_TYPES = {"cards", "yookassa_qr", "wata", "platega", "cardlink", "balance"}
-CENTS_PAYMENT_TYPES = {"crypto", "cryptobot"} | RUB_PAYMENT_TYPES
 
 PAYMENT_MINIMUMS = {
     "crypto": 1,
@@ -67,13 +65,7 @@ def _amount_unit(payment_type: str) -> str:
 def _base_amount(tariff: Dict[str, Any], payment_type: str) -> int:
     if payment_type not in {"stars", "crypto", "cryptobot"} | RUB_PAYMENT_TYPES and not _is_custom_payment_type(payment_type):
         raise ValueError(f"Неизвестный тип оплаты: {payment_type}")
-    if tariff.get('price_minor') is not None:
-        return max(0, int(tariff.get('price_minor') or 0))
-    try:
-        legacy_rubles = Decimal(str(tariff.get('price_rub') or 0))
-    except (InvalidOperation, TypeError, ValueError):
-        legacy_rubles = Decimal('0')
-    return max(0, int((legacy_rubles * Decimal('100')).to_integral_value(rounding=ROUND_HALF_UP)))
+    return max(0, int(tariff.get('price_minor') or 0))
 
 
 def format_amount(amount: int, payment_type: str) -> str:
@@ -387,10 +379,8 @@ def prepare_order_pricing(
         snapshot_saved = save_order_pricing_snapshot(
             order_id=order_id,
             payment_type=payment_type,
-            original_amount=quote["original_amount"],
-            discount_amount=quote["discount_amount"],
-            final_amount=quote["final_amount"],
-            amount_unit=quote["amount_unit"],
+            nominal_amount_minor=quote["nominal_amount_minor"],
+            payable_amount_minor=quote["payable_amount_minor"],
             promo=quote["promo"],
         )
     except Exception:
@@ -480,12 +470,7 @@ def apply_order_promotion_after_payment(order: Dict[str, Any]) -> Optional[Dict[
 
 
 def _order_final_amount(order: Dict[str, Any]) -> int:
-    payment_type = order.get("payment_type")
-    if payment_type == "stars":
-        return int(order.get("final_amount_stars") if order.get("final_amount_stars") is not None else order.get("amount_stars") or 0)
-    if payment_type in CENTS_PAYMENT_TYPES or _is_custom_payment_type(payment_type):
-        return int(order.get("final_amount_cents") if order.get("final_amount_cents") is not None else order.get("amount_cents") or 0)
-    return 0
+    return max(0, int(order.get('payable_amount_minor') or 0))
 
 
 def maybe_issue_auto_coupon_after_payment(order: Dict[str, Any]) -> Optional[Dict[str, Any]]:

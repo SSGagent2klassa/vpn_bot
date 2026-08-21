@@ -66,77 +66,46 @@ async def handle_payment_deeplink(
         from bot.services.payment_intents import load_payment_intent
 
         intent = load_payment_intent(order_id)
-        if intent:
-            from bot.services.payment_completion import complete_confirmed_payment
-            from bot.services.payment_provider_adapters import check_provider_invoice
-            from database.requests import get_payment_provider_order
-
-            provider_alias = {
-                'yookassa': 'yookassa_qr',
-                'wata': 'wata',
-                'platega': 'platega',
-                'cardlink': 'cardlink',
-            }
-            provider_order = get_payment_provider_order(order_id)
-            if (
-                intent.user_id != user_internal_id
-                or not provider_order
-                or provider_order.get('provider_id') != provider_alias.get(provider)
-            ):
-                await _show_deeplink_status('payment_order_unavailable')
-                return True
-            try:
-                status = await check_provider_invoice(intent)
-            except Exception as error:
-                logger.warning('Intent deep-link check failed order=%s: %s', order_id, error)
-                await _show_deeplink_status('payment_failed', order_id=order_id)
-                return True
-            if status == 'succeeded':
-                await complete_confirmed_payment(
-                    order_id,
-                    bot=message.bot,
-                    target=message,
-                    state=state,
-                    telegram_id=telegram_id,
-                    payment_type=intent.payment_type or '',
-                    referral_amount=0,
-                )
-            elif status == 'canceled':
-                await _show_deeplink_status('payment_canceled', order_id=order_id)
-            else:
-                await _show_deeplink_status('payment_pending', order_id=order_id)
-            return True
-
-        from bot.handlers.user.payments.legacy import run_legacy_provider_check
-
-        await run_legacy_provider_check(
-            provider,
-            message,
-            state,
-            order_id=order_id,
-            telegram_id=telegram_id,
-            callback=None,
-        )
-        return True
-
-    # Compatible with old Cardlink links from store settings.
-    if start_param.startswith('cl_'):
-        from database.requests import find_latest_pending_cardlink_order_for_user
-        from bot.handlers.user.payments.legacy import run_legacy_provider_check
-
-        order = find_latest_pending_cardlink_order_for_user(user_internal_id)
-        if not order:
+        if intent is None:
             await _show_deeplink_status('payment_order_unavailable')
             return True
 
-        await run_legacy_provider_check(
-            'cardlink',
-            message,
-            state,
-            order_id=order['order_id'],
-            telegram_id=telegram_id,
-            callback=None,
-        )
+        from bot.services.payment_completion import complete_confirmed_payment
+        from bot.services.payment_provider_adapters import check_provider_invoice
+        from database.requests import get_payment_provider_order
+
+        provider_alias = {
+            'yookassa': 'yookassa_qr',
+            'wata': 'wata',
+            'platega': 'platega',
+            'cardlink': 'cardlink',
+        }
+        provider_order = get_payment_provider_order(order_id)
+        if (
+            intent.user_id != user_internal_id
+            or not provider_order
+            or provider_order.get('provider_id') != provider_alias.get(provider)
+        ):
+            await _show_deeplink_status('payment_order_unavailable')
+            return True
+        try:
+            status = await check_provider_invoice(intent)
+        except Exception as error:
+            logger.warning('Intent deep-link check failed order=%s: %s', order_id, error)
+            await _show_deeplink_status('payment_failed', order_id=order_id)
+            return True
+        if status == 'succeeded':
+            await complete_confirmed_payment(
+                order_id,
+                bot=message.bot,
+                target=message,
+                state=state,
+                telegram_id=telegram_id,
+            )
+        elif status == 'canceled':
+            await _show_deeplink_status('payment_canceled', order_id=order_id)
+        else:
+            await _show_deeplink_status('payment_pending', order_id=order_id)
         return True
 
     return False
@@ -144,34 +113,34 @@ async def handle_payment_deeplink(
 
 @router.pre_checkout_query()
 async def pre_checkout_handler(pre_checkout: PreCheckoutQuery):
-    """Confirms legacy invoices and validates ownership/amount for v1 intents."""
+    """Validates ownership and the immutable amount of a v1 invoice."""
     from database.requests import get_or_create_user
     from bot.services.payment_intents import load_payment_intent
     from bot.utils.user_ui_texts import get_ui_text
 
-    order_id = _invoice_order_id(pre_checkout.invoice_payload)
+    order_id = str(pre_checkout.invoice_payload or '')
     intent = load_payment_intent(order_id)
-    if intent:
-        owner, _ = get_or_create_user(
-            pre_checkout.from_user.id,
-            pre_checkout.from_user.username,
-            pre_checkout.from_user.first_name,
-            pre_checkout.from_user.last_name,
+    owner, _ = get_or_create_user(
+        pre_checkout.from_user.id,
+        pre_checkout.from_user.username,
+        pre_checkout.from_user.first_name,
+        pre_checkout.from_user.last_name,
+    )
+    owner_id = int(owner["id"])
+    expected_amount = _native_invoice_amount(intent) if intent else 0
+    if (
+        intent is None
+        or not owner_id
+        or owner_id != intent.user_id
+        or intent.status != 'pending'
+        or pre_checkout.currency != intent.charge_currency
+        or int(pre_checkout.total_amount) != expected_amount
+    ):
+        await pre_checkout.answer(
+            ok=False,
+            error_message=get_ui_text("payment.invoice.stale_error"),
         )
-        owner_id = int(owner["id"])
-        expected_amount = _native_invoice_amount(intent)
-        if (
-            not owner_id
-            or owner_id != intent.user_id
-            or intent.status != 'pending'
-            or pre_checkout.currency != intent.charge_currency
-            or int(pre_checkout.total_amount) != expected_amount
-        ):
-            await pre_checkout.answer(
-                ok=False,
-                error_message=get_ui_text("payment.invoice.stale_error"),
-            )
-            return
+        return
     await pre_checkout.answer(ok=True)
 
 @router.message(F.successful_payment)
@@ -188,27 +157,30 @@ async def successful_payment_handler(message: Message, state: FSMContext):
     payment_type = 'stars' if currency == 'XTR' else 'cards'
     logger.info(f'Успешная оплата {payment_type}: {payload}, charge_id={payment.telegram_payment_charge_id}')
     
-    order_id = _invoice_order_id(payload)
+    order_id = str(payload or '')
 
     from bot.services.payment_intents import load_payment_intent
     intent = load_payment_intent(order_id)
-    if intent:
-        from database.requests import get_user_internal_id, update_payment_provider_order_status
+    if intent is None:
+        logger.error('Rejected successful payment without a v1 intent order=%s', order_id)
+        return
 
-        owner_id = get_user_internal_id(message.from_user.id)
-        if (
-            not owner_id
-            or owner_id != intent.user_id
-            or payment.currency != intent.charge_currency
-            or int(payment.total_amount) != _native_invoice_amount(intent)
-        ):
-            logger.error('Rejected mismatched successful intent payment order=%s', order_id)
-            return
-        update_payment_provider_order_status(
-            order_id,
-            'succeeded',
-            provider_payment_id=payment.telegram_payment_charge_id,
-        )
+    from database.requests import get_user_internal_id, update_payment_provider_order_status
+
+    owner_id = get_user_internal_id(message.from_user.id)
+    if (
+        not owner_id
+        or owner_id != intent.user_id
+        or payment.currency != intent.charge_currency
+        or int(payment.total_amount) != _native_invoice_amount(intent)
+    ):
+        logger.error('Rejected mismatched successful intent payment order=%s', order_id)
+        return
+    update_payment_provider_order_status(
+        order_id,
+        'succeeded',
+        provider_payment_id=payment.telegram_payment_charge_id,
+    )
     
     await complete_confirmed_payment(
         order_id,
@@ -216,17 +188,7 @@ async def successful_payment_handler(message: Message, state: FSMContext):
         target=message,
         state=state,
         telegram_id=message.from_user.id,
-        payment_type=payment_type,
-        referral_amount=payment.total_amount
     )
-
-
-def _invoice_order_id(payload: str) -> str:
-    """Extracts a core order id from legacy and v1 Telegram invoice payloads."""
-    value = str(payload or '')
-    if value.startswith('renew:') or value.startswith('vpn_key:'):
-        return value.split(':', 1)[1]
-    return value
 
 
 def _native_invoice_amount(intent) -> int:

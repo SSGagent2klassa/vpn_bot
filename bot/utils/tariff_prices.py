@@ -71,7 +71,7 @@ def load_tariff_price_display_config() -> TariffPriceDisplayConfig:
 
 
 def format_tariff_price_display(
-    price: Any,
+    price: Mapping[str, Any],
     *,
     config: TariffPriceDisplayConfig | None = None,
 ) -> str:
@@ -126,16 +126,11 @@ def format_tariff_price_display(
 
 
 def _resolve_price(
-    price: Any,
+    price: Mapping[str, Any],
     config: TariffPriceDisplayConfig,
 ) -> tuple[str, int]:
-    if isinstance(price, Mapping):
-        base = str(price.get('base_currency') or config.base_currency or 'RUB').upper()
-        if price.get('price_minor') is not None:
-            return base, max(0, int(price.get('price_minor') or 0))
-        return 'RUB', max(0, int(price.get('price_rub') or 0)) * 100
-    # Compatibility for old callers that pass a RUB-major scalar.
-    return 'RUB', max(0, int(price or 0)) * 100
+    base = str(price.get('base_currency') or config.base_currency or 'RUB').upper()
+    return base, max(0, int(price.get('price_minor') or 0))
 
 
 __all__ = [

@@ -19,18 +19,14 @@ from collections import defaultdict
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Dict, Any, Tuple
 
-from bot.utils.billing_values import resolve_duration_days
-
 from database.requests import (
-    find_order_by_order_id, complete_order, is_order_already_paid,
+    find_order_by_order_id,
     get_setting,
     get_yookassa_credentials, get_wata_token, get_platega_credentials,
     get_cardlink_credentials,
     is_referral_enabled, get_referral_reward_type, get_active_referral_levels,
-    get_user_referrer, get_user_referral_coefficient, get_user_balance,
-    update_referral_stat
+    get_user_referrer, get_user_referral_coefficient,
 )
-from bot.services.exchange_rate import get_usd_rub_rate
 from bot.services.payment_api import (
     PaymentApiRateLimitError,
     PaymentApiResponseError,
@@ -41,9 +37,6 @@ from bot.services.payment_api import (
 from bot.utils.telegram_links import build_telegram_link
 
 logger = logging.getLogger(__name__)
-
-STAR_TO_USD = 0.013
-USDT_TO_USD = 1.0
 
 YOOKASSA_API_URL = "https://api.yookassa.ru/v3/payments"
 WATA_API_URL = "https://api.wata.pro/api/h2h"
@@ -241,7 +234,7 @@ def parse_crypto_callback(start_param: str) -> Optional[Dict[str, Any]]:
         Dictionary with fields: order_id, item_id, tariff, promo, price, signature, data_part
         or None if the format is invalid
     """
-    if not start_param or not start_param.startswith('bill'):
+    if not start_param or not start_param.startswith('bill1-'):
         return None
     
     parts = start_param.split('-')
@@ -258,7 +251,7 @@ def parse_crypto_callback(start_param: str) -> Optional[Dict[str, Any]]:
         data_part = start_param.rsplit('-', 1)[0]
         
         return {
-            'prefix': parts[0],        # bill1 or bill0
+            'prefix': parts[0],        # Payment Intent v1
             'order_id': parts[1],      # our invoice_id
             'item_id': parts[2],       # Product ID in Ya.Seller
             'tariff': parts[3],        # tariff number (1-9) or '_'
@@ -272,230 +265,59 @@ def parse_crypto_callback(start_param: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _get_order_payment_action(order: Optional[Dict[str, Any]]) -> str:
-    """Determines the type of transaction based on the state of the order before payment is processed."""
-    purpose = str((order or {}).get('purpose') or '')
-    if purpose in {'key_purchase', 'key_renewal', 'balance_topup'}:
-        return purpose
-    if order and order.get('vpn_key_id'):
-        return 'renewal'
-    return 'new_key'
-
-
-def _supports_payment_completion_retry(order: Optional[Dict[str, Any]]) -> bool:
-    payment_type = str((order or {}).get('payment_type') or '')
-    return payment_type in {'yookassa_qr', 'wata', 'platega', 'cardlink'} or payment_type.startswith('ext_')
-
-
 def _mark_order_runtime_flags(
     order: Optional[Dict[str, Any]],
     *,
     processed_now: bool,
-    payment_action: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Adds service flags that are not saved in the database."""
     if order is not None:
         order['_payment_processed_now'] = processed_now
-        order['_payment_action'] = payment_action or _get_order_payment_action(order)
     return order
 
 
 async def process_payment_order(
     order_id: str,
     bot: Optional[Any] = None,
-    process_referrals: bool = True,
 ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
     async with _payment_order_locks[order_id]:
         return await _process_payment_order_unlocked(
             order_id,
             bot=bot,
-            process_referrals=process_referrals,
         )
 
 
 async def _process_payment_order_unlocked(
     order_id: str,
     bot: Optional[Any] = None,
-    process_referrals: bool = True,
 ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
-    """
-    Universal processing of a successful order (Crypto or Stars).
-    Closes an order, extends a key, or creates a draft.
-    
-    Returns:
-        (success, message_text, order_data)
-    """
-    from database.requests import (
-        is_order_already_paid, find_order_by_order_id, complete_order, 
-        create_initial_vpn_key, reopen_paid_order, update_payment_key_id
-    )
-    
-    # 1. Order search and v1 intent dispatch.
+    """Fulfill one provider-confirmed Payment Intent v1."""
     order = find_order_by_order_id(order_id)
     if not order:
         logger.warning(f"Ордер не найден: {order_id}")
         return False, "order_not_found", None
-    if int(order.get('intent_version') or 0) == 1:
-        from bot.services.payment_fulfillment import fulfill_payment_intent
+    if int(order.get('intent_version') or 0) != 1:
+        logger.warning('Rejected non-v1 payment completion order=%s', order_id)
+        return False, 'payment_intent_required', order
 
-        result = await fulfill_payment_intent(
-            order_id,
-            bot=bot,
-            # Payment Intent v1 owns every financial post-action. Legacy callers
-            # may disable their old post-actions, but must not disable v1 referrals.
-            process_referrals=True,
-        )
-        fresh_order = find_order_by_order_id(order_id) or order
-        _mark_order_runtime_flags(
-            fresh_order,
-            processed_now=bool(result.completed and not result.already_completed),
-            payment_action=result.purpose,
-        )
-        fresh_order['_post_actions_completed'] = bool(result.completed)
-        return bool(result.completed), result.message, fresh_order
+    from bot.services.payment_fulfillment import fulfill_payment_intent
 
-    # 2. Legacy duplicate protection.
-    if is_order_already_paid(order_id):
-        return True, "already_completed", _mark_order_runtime_flags(
-            order,
-            processed_now=False,
-        )
-    payment_action = _get_order_payment_action(order)
-    
-    # 3. Close the order
-    if not complete_order(order_id):
-        # If the parallel processor has already closed the order, we do not perform side actions again.
-        fresh_order = find_order_by_order_id(order_id)
-        if fresh_order and fresh_order.get('status') == 'paid':
-            return True, "already_completed", _mark_order_runtime_flags(
-                fresh_order,
-                processed_now=False,
-            )
-        return False, "order_update_failed", order
-    _mark_order_runtime_flags(order, processed_now=True, payment_action=payment_action)
-    
-    logger.info(f"Order {order_id} processed (paid)")
-
-    try:
-        from bot.services.promotions import apply_order_promotion_after_payment
-        apply_order_promotion_after_payment(order)
-    except Exception as promo_err:
-        logger.warning("Ошибка post-payment обработки промокода для order=%s: %s", order_id, promo_err)
-
-    async def _issue_auto_coupon_text() -> str:
-        try:
-            from bot.services.promotions import (
-                format_auto_coupon_text,
-                maybe_issue_auto_coupon_after_payment_async,
-            )
-            auto_coupon = await maybe_issue_auto_coupon_after_payment_async(order)
-            if auto_coupon:
-                order["_auto_coupon"] = auto_coupon
-                return format_auto_coupon_text(auto_coupon)
-        except Exception as coupon_err:
-            logger.warning("Не удалось выдать авто-купон для order=%s: %s", order_id, coupon_err)
-        return ""
-
-    user_internal_id = order['user_id']
-    days = resolve_duration_days(order)
-
-    if order['vpn_key_id']:
-        from bot.services.key_lifecycle import renew_key_access
-        renew_result = await renew_key_access(
-            order['vpn_key_id'],
-            days,
-            reset_traffic=True,
-            tariff_id=order.get('tariff_id'),
-        )
-        if renew_result['db_updated']:
-            if days == 0:
-                logger.info(
-                    "Ключ %s переведён на бессрочный тариф (order=%s)",
-                    order['vpn_key_id'],
-                    order_id,
-                )
-            else:
-                logger.info(f"Ключ {order['vpn_key_id']} продлён на {days} дней (order={order_id})")
-            if not renew_result['panel_synced']:
-                logger.warning(
-                    f"Ключ {order['vpn_key_id']} продлён в БД, но панель синхронизирована "
-                    f"не полностью: {renew_result.get('sync_stats')}"
-                )
-
-            if process_referrals and order.get('payment_type') == 'crypto':
-                await process_referral_reward(
-                    user_internal_id, days, order.get('final_amount_cents') if order.get('final_amount_cents') is not None else order.get('amount_cents', 0), 'crypto',
-                    bot=bot, order=order
-                )
-            
-            await _issue_auto_coupon_text()
-            return True, "key_renewed", order
-        else:
-            logger.error(f"Не удалось продлить ключ {order['vpn_key_id']} после оплаты!")
-            if _supports_payment_completion_retry(order):
-                reopen_paid_order(order_id)
-                return False, "key_renewal_failed", order
-            return True, "key_renewal_degraded", order
-    else:
-        if not order.get('tariff_id'):
-            logger.error(f"Ордер {order_id}: тариф не найден или неактивен в БД (received tariff_id could not be resolved).")
-            if _supports_payment_completion_retry(order):
-                reopen_paid_order(order_id)
-            from bot.errors import TariffNotFoundError
-            raise TariffNotFoundError()
-        
-        try:
-            days = resolve_duration_days(order)
-            # We get the traffic limit from the tariff
-            from database.requests import get_tariff_by_id as _get_tariff
-            _tariff = _get_tariff(order['tariff_id'])
-            traffic_limit_bytes = (_tariff.get('traffic_limit_gb', 0) or 0) * (1024**3) if _tariff else 0
-            key_id = create_initial_vpn_key(order['user_id'], order['tariff_id'], days, traffic_limit=traffic_limit_bytes)
-            
-            update_payment_key_id(order_id, key_id)
-            order['vpn_key_id'] = key_id
-            try:
-                from bot.services.key_lifecycle import emit_key_lifecycle_event_safe
-
-                await emit_key_lifecycle_event_safe(
-                    'key_created',
-                    {
-                        'key_id': key_id,
-                        'user_id': order['user_id'],
-                        'tariff_id': order['tariff_id'],
-                        'days': days,
-                        'traffic_limit': traffic_limit_bytes,
-                        'order_id': order_id,
-                        'payment_type': order.get('payment_type'),
-                        'source': 'payment',
-                    },
-                )
-            except Exception as hook_err:
-                logger.warning(f"Не удалось вызвать lifecycle hooks создания ключа {key_id}: {hook_err}")
-            
-            logger.info(f"Создан черновик ключа {key_id} для заказа {order_id}")
-            
-            if process_referrals and order.get('payment_type') == 'crypto':
-                await process_referral_reward(
-                    user_internal_id, days, order.get('final_amount_cents') if order.get('final_amount_cents') is not None else order.get('amount_cents', 0), 'crypto',
-                    bot=bot, order=order
-                )
-            
-            await _issue_auto_coupon_text()
-            return True, "key_purchase_completed", order
-            
-        except Exception as e:
-            logger.error(f"Ошибка создания черновика ключа: {e}")
-            if _supports_payment_completion_retry(order):
-                reopen_paid_order(order_id)
-                return False, "key_creation_failed", order
-            return True, "key_creation_degraded", order
+    result = await fulfill_payment_intent(
+        order_id,
+        bot=bot,
+        process_referrals=True,
+    )
+    fresh_order = find_order_by_order_id(order_id) or order
+    _mark_order_runtime_flags(
+        fresh_order,
+        processed_now=bool(result.completed and not result.already_completed),
+    )
+    return bool(result.completed), result.message, fresh_order
 
 
 async def process_crypto_payment(
     start_param: str,
     user_id: Optional[int] = None,
-    bot: Optional[Any] = None,
 ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
     """
     Processes payment from cryptoprocessing (parse + verify + confirm).
@@ -517,48 +339,37 @@ async def process_crypto_payment(
     
     order_id = parsed['order_id']
     
-    # --- ORDER PROCESSING LOGIC (External/Internal) ---
-    is_internal_order = order_id.startswith("00")
     order = find_order_by_order_id(order_id)
-    
-    if order:
-        if int(order.get('intent_version') or 0) == 1:
-            if user_id is not None and int(order.get('user_id') or 0) != int(user_id):
-                return False, "wrong_owner", None
-            expected_cents = order.get('final_amount_cents') if order.get('final_amount_cents') is not None else order.get('amount_cents', 0)
-            received_cents = parsed.get('price', 0)
-            if received_cents < expected_cents:
-                logger.error(f"Ордер {order_id}: Сумма платежа недостаточна. Ожидалось {expected_cents}, получено {received_cents}")
-                return False, "amount_mismatch", None
-            from database.requests import update_payment_provider_order_status
+    if not order or int(order.get('intent_version') or 0) != 1:
+        return False, "order_not_found", None
+    if user_id is not None and int(order.get('user_id') or 0) != int(user_id):
+        return False, "wrong_owner", None
 
-            update_payment_provider_order_status(order_id, 'succeeded')
-        else:
-            # Legacy invoices validate against their tariff-backed amount.
-            from database.requests import get_tariff_by_id
+    from database.requests import (
+        get_payment_provider_order,
+        update_payment_provider_order_status,
+    )
 
-            order_tariff = get_tariff_by_id(order['tariff_id'])
-            if order_tariff:
-                expected_cents = order.get('final_amount_cents') if order.get('final_amount_cents') is not None else order.get('amount_cents', 0)
-                received_cents = parsed.get('price', 0)
-                if received_cents < expected_cents:
-                    logger.error(f"Ордер {order_id}: Сумма платежа недостаточна. Ожидалось {expected_cents}, получено {received_cents}")
-                    return False, "amount_mismatch", None
-    
-    if not order:
-        if is_internal_order:
-             return False, "order_not_found", None
-        
-        # External order -> Create a PAID order in the database BEFORE processing
-        if not user_id:
-             return False, "external_owner_missing", None
-        
-        logger.info(f"Новый внешний ордер: {order_id}")
-        
-        # External order without tariff - error
-        logger.error(f"Внешний ордер {order_id} без привязки к тарифу!")
-        from bot.errors import TariffNotFoundError
-        raise TariffNotFoundError()
+    provider_order = get_payment_provider_order(order_id)
+    if not provider_order or str(provider_order.get('provider_id') or '') != 'crypto':
+        return False, 'provider_mismatch', None
+    try:
+        expected_cents = int(
+            (Decimal(str(order.get('charge_amount') or '0')) * Decimal('100'))
+            .to_integral_value(rounding=ROUND_HALF_UP)
+        )
+    except (ArithmeticError, ValueError):
+        return False, 'amount_snapshot_missing', None
+    received_cents = int(parsed.get('price') or 0)
+    if expected_cents <= 0 or received_cents < expected_cents:
+        logger.error(
+            "Crypto payment amount mismatch order=%s expected=%s received=%s",
+            order_id,
+            expected_cents,
+            received_cents,
+        )
+        return False, "amount_mismatch", None
+    update_payment_provider_order_status(order_id, 'succeeded')
     
     # Signature/provider confirmation ends here. Closing the order and every
     # continuation is owned by complete_confirmed_payment at the entry point.
@@ -1195,10 +1006,9 @@ async def create_cardlink_payment(
     The body is sent as application/x-www-form-urlencoded.
     Authorization via Bearer token.
 
-    Distinctive feature: instead of a webhook, the user after payment
-    returns to the bot via deep-link `https://<telegram_link_domain>/{bot}?start=cl_Success`
-    (or cl_Fail / cl_Result), which triggers the same check as
-    “✅ I paid” button.
+    Instead of a webhook, every invoice receives an order-bound Payment
+    Intent v1 return link. The returned order is checked through the same
+    provider adapter as the manual status action.
 
     Args:
         amount_rub: Amount in rubles
@@ -1365,55 +1175,19 @@ async def check_cardlink_payment_status(
     return 'pending'
 
 
-def convert_to_rub_cents(amount_raw: int, payment_type: str, usd_rub_rate: int) -> int:
-    """
-    Convert the raw amount into kopecks of rubles.
-
-    Args:
-        amount_raw: raw amount (stars/USDT cents/ruble pennies)
-        payment_type: payment type ('stars', 'crypto', 'cards', 'yookassa_qr', 'wata', 'platega')
-        usd_rub_rate: USD/RUB rate in kopecks
-
-    Returns:
-        Amount in kopecks of rubles
-    """
-    if payment_type == 'stars':
-        usd_cents = int(amount_raw * STAR_TO_USD * 100)
-        return usd_cents * usd_rub_rate // 100
-    elif payment_type == 'crypto':
-        usd_cents = amount_raw
-        return usd_cents * usd_rub_rate // 100
-    else:
-        return amount_raw
-
-
 async def process_referral_reward(
     payer_id: int,
     period_days: int,
-    amount_raw: int,
+    amount_minor: int,
     payment_type: str,
+    *,
+    order: Dict[str, Any],
     bot: Optional[Any] = None,
-    order: Optional[Dict[str, Any]] = None,
 ) -> list[Dict[str, Any]]:
-    """
-    Processing referral rewards upon payment.
-    Called AFTER successful payment processing.
-    
-    Args:
-        payer_id: Internal ID of the user who paid
-        period_days: How many days did the referral buy?
-        amount_raw: RAW amount:
-            - 'stars': number of stars (int)
-            - 'crypto': USDT cents (int)
-            - 'cards': kopecks of rubles (int)
-            - 'yookassa_qr': kopecks of rubles (int)
-        payment_type: Payment type ('stars', 'crypto', 'cards', 'yookassa_qr')
-    
-    Note:
-        When paying with balance, referral rewards are NOT accrued,
-        therefore this function is not called for balance payments.
-    """
-    if payment_type in ('balance', 'trial', 'promo_free') or amount_raw <= 0:
+    """Apply referral rewards for one paid Payment Intent v1."""
+    if int(order.get('intent_version') or 0) != 1:
+        raise ValueError('Referral rewards require Payment Intent v1')
+    if payment_type in ('balance', 'trial', 'promo_free') or amount_minor <= 0:
         return []
 
     if not is_referral_enabled():
@@ -1425,22 +1199,14 @@ async def process_referral_reward(
     if not active_levels:
         return []
     
-    if int((order or {}).get('intent_version') or 0) == 1:
-        amount_base_minor = int(
-            (order or {}).get('payable_amount_minor')
-            or (order or {}).get('payable_amount_cents')
-            or 0
-        )
-        base_currency = str((order or {}).get('base_currency') or 'RUB').upper()
-    else:
-        usd_rub_rate = await get_usd_rub_rate()
-        amount_base_minor = convert_to_rub_cents(amount_raw, payment_type, usd_rub_rate)
-        base_currency = 'RUB'
+    amount_base_minor = int(order.get('payable_amount_minor') or 0)
+    base_currency = str(order.get('base_currency') or 'RUB').upper()
     
     current_user_id = payer_id
     events = []
-    is_v1_intent = int((order or {}).get('intent_version') or 0) == 1
-    payment_order_id = str((order or {}).get('order_id') or '')
+    payment_order_id = str(order.get('order_id') or '')
+    if not payment_order_id:
+        raise ValueError('Payment Intent order_id is required')
     
     for level_num in (1, 2, 3):
         referrer_id = get_user_referrer(current_user_id)
@@ -1455,21 +1221,16 @@ async def process_referral_reward(
         coefficient = get_user_referral_coefficient(referrer_id)
         
         if reward_type == 'balance':
-            if is_v1_intent:
-                base_reward = (
-                    Decimal(amount_base_minor)
-                    * Decimal(str(percent))
-                    / Decimal('100')
+            base_reward = (
+                Decimal(amount_base_minor)
+                * Decimal(str(percent))
+                / Decimal('100')
+            )
+            final_reward = int(
+                (base_reward * Decimal(str(coefficient))).to_integral_value(
+                    rounding=ROUND_HALF_UP
                 )
-                final_reward = int(
-                    (base_reward * Decimal(str(coefficient))).to_integral_value(
-                        rounding=ROUND_HALF_UP
-                    )
-                )
-            else:
-                base_reward = amount_base_minor * (percent / 100)
-                final_reward = int(base_reward * coefficient)
-                final_reward = round(final_reward / 100) * 100
+            )
             reward_days = 0
         else:
             base_days = period_days * (percent / 100)
@@ -1491,14 +1252,14 @@ async def process_referral_reward(
                     'level': level_num,
                     'reward_type': reward_type,
                     'period_days': period_days,
-                    'amount_raw': amount_raw,
+                    'amount_raw': amount_minor,
                     'base_currency': base_currency,
                     'amount_base_minor': amount_base_minor,
                     'amount_rub_cents': amount_base_minor,
                     'payment_type': payment_type,
                     'percent': percent,
                     'coefficient': coefficient,
-                    'order': dict(order or {}),
+                    'order': dict(order),
                 },
             )
             final_reward = int(reward_decision.get('reward_cents') or 0)
@@ -1513,12 +1274,8 @@ async def process_referral_reward(
         if final_reward > 0:
             from bot.services.balance import credit_user_balance
 
-            reference_type = 'payment_referral' if is_v1_intent else 'payment_order'
-            reference_id = (
-                f'{payment_order_id}:{level_num}'
-                if is_v1_intent
-                else payment_order_id
-            )
+            reference_type = 'payment_referral'
+            reference_id = f'{payment_order_id}:{level_num}'
 
             balance_result = await credit_user_balance(
                 referrer_id,
@@ -1540,12 +1297,8 @@ async def process_referral_reward(
         if reward_days > 0:
             from bot.services.rewards import grant_days_to_first_active_key
 
-            reference_type = 'payment_referral' if is_v1_intent else 'payment_order'
-            reference_id = (
-                f'{payment_order_id}:{level_num}'
-                if is_v1_intent
-                else payment_order_id
-            )
+            reference_type = 'payment_referral'
+            reference_id = f'{payment_order_id}:{level_num}'
 
             days_result = await grant_days_to_first_active_key(
                 referrer_id,
@@ -1566,24 +1319,17 @@ async def process_referral_reward(
 
         applied_reward_type = 'balance' if final_reward > 0 else ('days' if reward_days > 0 else reward_type)
         
-        if is_v1_intent:
-            from database.requests import record_payment_referral_stat_once
+        from database.requests import record_payment_referral_stat_once
 
-            record_payment_referral_stat_once(
-                payment_order_id,
-                level=level_num,
-                referrer_id=referrer_id,
-                payer_id=payer_id,
-                reward_cents=final_reward,
-                reward_minor=final_reward,
-                reward_days=reward_days,
-                reward_currency=base_currency,
-            )
-        else:
-            update_referral_stat(
-                referrer_id, payer_id, level_num,
-                final_reward, reward_days
-            )
+        record_payment_referral_stat_once(
+            payment_order_id,
+            level=level_num,
+            referrer_id=referrer_id,
+            payer_id=payer_id,
+            reward_minor=final_reward,
+            reward_days=reward_days,
+            reward_currency=base_currency,
+        )
 
         events.append({
             'referrer_id': referrer_id,
@@ -1597,7 +1343,7 @@ async def process_referral_reward(
             'reward_policy': reward_policy,
             'reward_policies': reward_policies,
             'period_days': period_days,
-            'amount_raw': amount_raw,
+            'amount_raw': amount_minor,
             'amount_base_minor': amount_base_minor,
             'base_currency': base_currency,
             'amount_rub_cents': amount_base_minor,
@@ -1606,7 +1352,7 @@ async def process_referral_reward(
         
         current_user_id = referrer_id
 
-    if bot is not None and order is not None and events:
+    if bot is not None and events:
         try:
             from bot.services.notifications import notify_referrers_purchase
             await notify_referrers_purchase(bot, order, events)
@@ -1614,113 +1360,3 @@ async def process_referral_reward(
             logger.warning(f'Ошибка уведомления рефоводов о покупке: {notify_err}')
 
     return events
-
-
-def calculate_balance_discount(user_id: int, tariff_price_cents: int) -> tuple[int, int]:
-    """
-    Calculate discount from balance. NO write-off!
-    
-    Args:
-        user_id: Internal user ID
-        tariff_price_cents: Tariff price in kopecks
-    
-    Returns:
-        Tuple (remaining_to_pay_cents, to_deduct_cents):
-        - remaining_to_pay_cents: how much you need to pay externally
-        - to_deduct_cents: how much will be debited from the balance IF SUCCESSFUL payment
-    """
-    balance = get_user_balance(user_id)
-    
-    if balance >= tariff_price_cents:
-        return 0, tariff_price_cents
-    else:
-        return tariff_price_cents - balance, balance
-
-
-def _payment_order_referral_amount(order: Dict[str, Any]) -> int:
-    """Returns the persisted amount used by post-payment referral processing."""
-    try:
-        if int(order.get('intent_version') or 0) == 1:
-            return int(
-                order.get('payable_amount_minor')
-                or order.get('payable_amount_cents')
-                or 0
-            )
-        if order.get('final_amount_cents') is not None:
-            return int(order.get('final_amount_cents') or 0)
-        return int(order.get('amount_cents') or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-async def _run_payment_post_actions(
-    order: Dict[str, Any],
-    *,
-    bot: Any,
-    payment_type: str,
-    referral_amount: int,
-    balance_override_cents: int = 0,
-    force: bool = False,
-) -> None:
-    """Runs first-processing-only financial and notification side effects."""
-    if order.get('_post_actions_completed'):
-        return
-    if not order.get('_payment_processed_now', True) and not force:
-        logger.info("Повторная обработка платежа %s: побочные действия пропущены", order.get('order_id'))
-        return
-
-    user_internal_id = int(order['user_id'])
-    persisted_balance = int(order.get('balance_deduct_cents') or 0)
-    balance_to_deduct = persisted_balance or max(0, int(balance_override_cents or 0))
-    if balance_to_deduct > 0:
-        from database.requests import has_balance_operation_reference
-
-        order_reference = str(order.get('order_id') or '')
-        already_debited = has_balance_operation_reference(
-            user_id=user_internal_id,
-            operation_type='debit',
-            source='payment_balance',
-            reference_type='payment_order',
-            reference_id=order_reference,
-        )
-        current_balance = get_user_balance(user_internal_id)
-        actual_deduct = 0 if already_debited else min(balance_to_deduct, current_balance)
-        if actual_deduct > 0:
-            from bot.services.balance import debit_user_balance
-
-            deduct_result = await debit_user_balance(
-                user_internal_id,
-                actual_deduct,
-                source='payment_balance',
-                reason='Списание баланса при оплате тарифа',
-                reference_type='payment_order',
-                reference_id=order_reference,
-                metadata={'payment_type': payment_type},
-            )
-            if not deduct_result.get('ok'):
-                raise RuntimeError(
-                    f"Не удалось списать сохранённую часть баланса: {deduct_result.get('status')}"
-                )
-            logger.info(
-                "Списано %s коп с баланса user=%s при частичной оплате (%s)",
-                actual_deduct,
-                user_internal_id,
-                payment_type,
-            )
-
-    days = resolve_duration_days(order)
-    await process_referral_reward(
-        user_internal_id,
-        days,
-        referral_amount,
-        payment_type,
-        bot=bot,
-        order=order,
-    )
-
-    try:
-        from bot.services.notifications import notify_admins_payment
-
-        await notify_admins_payment(bot, order)
-    except Exception as notify_err:
-        logger.warning("Ошибка уведомления об оплате order=%s: %s", order.get('order_id'), notify_err)

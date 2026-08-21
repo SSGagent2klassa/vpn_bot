@@ -28,6 +28,7 @@ __all__ = [
     'get_tariff_group_id',
     'set_group_monthly_traffic_reset',
     'toggle_group_monthly_traffic_reset',
+    'set_group_subscription_parent',
 ]
 
 def get_all_groups() -> List[Dict[str, Any]]:
@@ -40,7 +41,7 @@ def get_all_groups() -> List[Dict[str, Any]]:
     with get_db() as conn:
         cursor = conn.execute("""
             SELECT id, name, sort_order, monthly_traffic_reset_enabled,
-                   created_at
+                   subscription_parent_group_id, created_at
             FROM tariff_groups
             ORDER BY sort_order, id
         """)
@@ -59,7 +60,7 @@ def get_group_by_id(group_id: int) -> Optional[Dict[str, Any]]:
     with get_db() as conn:
         cursor = conn.execute("""
             SELECT id, name, sort_order, monthly_traffic_reset_enabled,
-                   created_at
+                   subscription_parent_group_id, created_at
             FROM tariff_groups
             WHERE id = ?
         """, (group_id,))
@@ -248,7 +249,7 @@ def get_tariffs_by_group(
         if not include_system:
             conditions.append("system_type IS NULL")
         cursor = conn.execute(f"""
-            SELECT id, name, duration_days, price_rub, price_minor,
+            SELECT id, name, duration_days, price_minor,
                    display_order, is_active, traffic_limit_gb, group_id,
                    max_ips, system_type
             FROM tariffs
@@ -379,3 +380,97 @@ def toggle_group_monthly_traffic_reset(group_id: int) -> Optional[bool]:
             (int(enabled), int(group_id)),
         )
         return enabled
+
+
+def set_group_subscription_parent(
+    group_id: int,
+    parent_group_id: Optional[int],
+) -> bool:
+    """Sets or clears the parent group used for subscription composition.
+
+    The write is serialized with other parent changes so two concurrent updates
+    cannot introduce a cycle after independently validating an older graph.
+
+    Returns False when either referenced group does not exist. Invalid IDs,
+    self-links and graph cycles are rejected with ValueError.
+    """
+    child_id = _normalize_group_id(group_id, field='group_id')
+    parent_id = (
+        None
+        if parent_group_id is None
+        else _normalize_group_id(parent_group_id, field='parent_group_id')
+    )
+    if parent_id == child_id:
+        raise ValueError('A tariff group cannot be its own subscription parent')
+
+    with get_db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        child = conn.execute(
+            'SELECT id FROM tariff_groups WHERE id = ?',
+            (child_id,),
+        ).fetchone()
+        if child is None:
+            return False
+
+        if parent_id is not None:
+            parent = conn.execute(
+                'SELECT id FROM tariff_groups WHERE id = ?',
+                (parent_id,),
+            ).fetchone()
+            if parent is None:
+                return False
+            if _subscription_parent_path_contains(
+                conn,
+                start_group_id=parent_id,
+                target_group_id=child_id,
+            ):
+                raise ValueError('Subscription parent relation would create a cycle')
+
+        cursor = conn.execute(
+            """
+            UPDATE tariff_groups
+            SET subscription_parent_group_id = ?
+            WHERE id = ?
+            """,
+            (parent_id, child_id),
+        )
+        return cursor.rowcount > 0
+
+
+def _subscription_parent_path_contains(
+    conn: sqlite3.Connection,
+    *,
+    start_group_id: int,
+    target_group_id: int,
+) -> bool:
+    """Returns whether following parent pointers reaches the target group."""
+    current_id: Optional[int] = int(start_group_id)
+    visited: set[int] = set()
+    while current_id is not None and current_id not in visited:
+        if current_id == target_group_id:
+            return True
+        visited.add(current_id)
+        row = conn.execute(
+            """
+            SELECT subscription_parent_group_id
+            FROM tariff_groups
+            WHERE id = ?
+            """,
+            (current_id,),
+        ).fetchone()
+        if row is None or row['subscription_parent_group_id'] is None:
+            return False
+        current_id = int(row['subscription_parent_group_id'])
+    return current_id is not None
+
+
+def _normalize_group_id(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f'{field} must be a positive integer')
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{field} must be a positive integer') from exc
+    if normalized <= 0:
+        raise ValueError(f'{field} must be a positive integer')
+    return normalized

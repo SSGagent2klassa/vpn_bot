@@ -13,18 +13,22 @@ logger = logging.getLogger(__name__)
 async def renew_key_access(
     key_id: int,
     days: int,
-    reset_traffic: bool = True,
+    reset_traffic: bool = False,
     tariff_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Universally extends or reduces the key term and synchronizes the panel.
+
+    Duration changes never reset consumed traffic. ``reset_traffic`` is kept
+    only for compatibility with older internal callers and is intentionally
+    ignored; traffic resets use their dedicated lifecycle paths.
 
     The database remains the source of truth. If the panel is unavailable or has been updated
     partially, the change in the database is not rolled back: re-synchronization will be able to
     make the most of it later.
     """
     from database.requests import extend_vpn_key
-    from bot.services.vpn_api import restore_traffic_limit_in_db, sync_key_to_panel_state
+    from bot.services.vpn_api import sync_key_to_panel_state
 
     result: Dict[str, Any] = {
         'db_updated': False,
@@ -86,12 +90,15 @@ async def renew_key_access(
             tariff_id,
             paid_traffic_limit or 0,
         )
-    else:
-        result['traffic_restored'] = restore_traffic_limit_in_db(key_id)
 
-    panel_reset_traffic = reset_traffic and not tariff_id
+    if reset_traffic:
+        logger.warning(
+            "renew_key_access ignored deprecated reset_traffic=True for key=%s; "
+            "use the dedicated traffic-reset operation",
+            key_id,
+        )
     try:
-        sync_stats = await sync_key_to_panel_state(key_id, reset_traffic=panel_reset_traffic)
+        sync_stats = await sync_key_to_panel_state(key_id, reset_traffic=False)
         result['sync_stats'] = sync_stats
         result['panel_synced'] = bool(sync_stats.get('ok')) and sync_stats.get('errors', 0) == 0
     except Exception as e:
@@ -103,7 +110,7 @@ async def renew_key_access(
         {
             'key_id': key_id,
             'days': days,
-            'reset_traffic': reset_traffic,
+            'reset_traffic': False,
             'tariff_id': tariff_id,
             'paid_traffic_limit': paid_traffic_limit,
             'result': dict(result),

@@ -451,6 +451,7 @@ def apply_balance_operation(
                     'currency': str(existing['currency']),
                     'balance_before': int(existing['balance_before']),
                     'balance_after': int(existing['balance_after']),
+                    'performed_by': existing['performed_by'],
                 }
         row = conn.execute(
             "SELECT personal_balance FROM users WHERE id = ?",
@@ -469,6 +470,8 @@ def apply_balance_operation(
                 'balance_before': before,
                 'balance_after': before,
                 'delta_cents': 0,
+                'delta_minor': 0,
+                'currency': operation_currency,
             }
 
         cursor = conn.execute(
@@ -522,6 +525,7 @@ def apply_balance_operation(
             'currency': operation_currency,
             'balance_before': before,
             'balance_after': after,
+            'performed_by': performed_by,
         }
 
 

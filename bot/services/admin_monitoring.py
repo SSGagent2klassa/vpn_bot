@@ -68,17 +68,6 @@ def _format_payments_sum(payments: Dict[str, Any]) -> str:
             for currency, amount in sorted(base_totals.items())
             if int(amount or 0) > 0
         )
-    cents = _safe_int(payments.get("paid_cents"))
-    rub = _safe_float(payments.get("paid_rub"), 0) or 0
-    stars = _safe_int(payments.get("paid_stars"))
-
-    if cents > 0:
-        parts.append(f"${cents / 100:g}".replace(".", ","))
-    if rub > 0:
-        parts.append(f"{rub:g}".replace(".", ",") + " ₽")
-    if stars > 0:
-        parts.append(f"⭐{stars}")
-
     return " + ".join(parts) if parts else "0"
 
 

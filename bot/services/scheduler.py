@@ -344,9 +344,6 @@ async def collect_daily_stats() -> str:
     
     # Payments
     payments_total = payments.get('paid_count', 0)
-    payments_cents = payments.get('paid_cents', 0)
-    payments_stars = payments.get('paid_stars', 0)
-    payments_rub = payments.get('paid_rub', 0)
     payments_pending = payments.get('pending_count', 0)
     
     payments_text = []
@@ -359,15 +356,6 @@ async def collect_daily_stats() -> str:
             for currency, amount in sorted(base_totals.items())
             if int(amount or 0) > 0
         )
-    if payments_cents > 0:
-        payments_val = payments_cents / 100
-        payments_str = f"{payments_val:g}".replace('.', ',')
-        payments_text.append(f"${payments_str}")
-    if payments_rub > 0:
-        rub_str = f"{payments_rub:g}".replace('.', ',')
-        payments_text.append(f"{rub_str} ₽")
-    if payments_stars > 0:
-        payments_text.append(f"⭐{payments_stars}")
     payments_sum = " + ".join(payments_text) if payments_text else "0"
     
     report = f"""📊 <b>Суточная статистика за {today}</b>
@@ -1392,6 +1380,25 @@ async def run_traffic_sync_scheduler(bot: Bot) -> None:
                     await process_expired_key_lifecycle_events()
                 except Exception as e:
                     logger.error(f"Ошибка обработки key_expired lifecycle events: {e}")
+                try:
+                    from bot.services.subscription_composition_reconcile import (
+                        enqueue_all_subscription_compositions_for_drift,
+                        process_due_subscription_compositions,
+                    )
+
+                    if materialize_due:
+                        enqueue_all_subscription_compositions_for_drift()
+                    composition_stats = await process_due_subscription_compositions()
+                    if composition_stats.get("seen"):
+                        logger.info(
+                            "subscription composition pass: %s",
+                            composition_stats,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "Ошибка reconciliation составных подписок: %s",
+                        type(e).__name__,
+                    )
                 cycle += 1
                 # Reuse the same snapshots every sixth cycle (about 30 minutes).
                 if materialize_due:

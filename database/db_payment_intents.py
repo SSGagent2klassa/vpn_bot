@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from typing import Any, Optional
 
 from .connection import get_db
-from .db_payments import _int_to_base62
+from .payment_order_ids import build_payment_order_id
 
 
 def create_payment_intent_record(
@@ -15,8 +15,7 @@ def create_payment_intent_record(
     user_id: int,
     purpose: str,
     purpose_data: Mapping[str, Any],
-    nominal_amount_minor: int | None = None,
-    nominal_amount_cents: int | None = None,
+    nominal_amount_minor: int,
     base_currency: str = 'RUB',
     description: str,
     success_target: Mapping[str, Any],
@@ -24,90 +23,124 @@ def create_payment_intent_record(
     tariff_id: int | None = None,
     vpn_key_id: int | None = None,
     period_days: int | None = None,
+    origin_context: Mapping[str, Any] | None = None,
+    origin_context_token: str | None = None,
 ) -> tuple[int, str]:
     """Creates an unquoted core payment intent and returns its id/order_id."""
     payload = _json_object(purpose_data)
     success = _json_object(success_target)
     cancel = _json_object(cancel_target)
-    raw_amount = nominal_amount_minor if nominal_amount_minor is not None else nominal_amount_cents
-    amount = _non_negative_int(raw_amount, 'nominal_amount_minor')
+    amount = _non_negative_int(nominal_amount_minor, 'nominal_amount_minor')
     currency = str(base_currency or 'RUB').upper()
     if currency not in {'RUB', 'USD'}:
         raise ValueError('base_currency must be RUB or USD')
+    if origin_context is not None and origin_context_token is not None:
+        raise ValueError('pass origin_context or origin_context_token, not both')
 
     with get_db() as conn:
+        normalized_origin = _normalize_payment_origin_context(origin_context)
+        if origin_context_token is not None:
+            from .db_action_contexts import consume_semantic_action_context_with_conn
+
+            consumed_origin = consume_semantic_action_context_with_conn(
+                conn,
+                origin_context_token,
+                user_id=int(user_id),
+                action='key.purchase.start',
+            )
+            if consumed_origin is None:
+                raise ValueError('origin context token is unavailable or expired')
+            normalized_origin = _normalize_payment_origin_context(consumed_origin)
         cursor = conn.execute(
             """
             INSERT INTO payments (
                 user_id, tariff_id, order_id, payment_type, vpn_key_id,
-                amount_cents, amount_stars, period_days, status, paid_at,
+                period_days, status, paid_at,
                 intent_version, purpose, purpose_data_json,
-                nominal_amount_cents, payable_amount_cents,
                 base_currency, nominal_amount_minor, payable_amount_minor,
                 description, success_target_json, cancel_target_json,
+                origin_extension_id, origin_context_version, origin_context_json,
+                origin_workflow_id, origin_completion_handler,
                 fulfillment_status, created_at
             )
             VALUES (
                 ?, ?, 'pending', NULL, ?,
-                ?, 0, ?, 'pending', NULL,
-                1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP
+                ?, 'pending', NULL,
+                1, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP
             )
             """,
             (
                 int(user_id),
                 tariff_id,
                 vpn_key_id,
-                amount,
                 period_days,
                 str(purpose),
                 payload,
-                amount,
-                amount,
                 currency,
                 amount,
                 amount,
                 str(description or ''),
                 success,
                 cancel,
+                (
+                    normalized_origin['owner_extension_id']
+                    if normalized_origin is not None
+                    else None
+                ),
+                (
+                    normalized_origin['schema_version']
+                    if normalized_origin is not None
+                    else None
+                ),
+                _json_object(
+                    normalized_origin['payload']
+                    if normalized_origin is not None
+                    else {}
+                ),
+                (
+                    normalized_origin['workflow_id']
+                    if normalized_origin is not None
+                    else None
+                ),
+                (
+                    normalized_origin['completion_handler']
+                    if normalized_origin is not None
+                    else None
+                ),
             ),
         )
         payment_id = int(cursor.lastrowid)
-        order_id = '00' + _int_to_base62(payment_id)
+        order_id = build_payment_order_id(payment_id)
         conn.execute(
             "UPDATE payments SET order_id = ? WHERE id = ?",
             (order_id, payment_id),
         )
+        if origin_context_token is not None:
+            from .db_action_contexts import attach_semantic_action_context_order_with_conn
+
+            if not attach_semantic_action_context_order_with_conn(
+                conn,
+                origin_context_token,
+                order_id=order_id,
+            ):
+                raise RuntimeError('consumed origin context could not be linked to its order')
         return payment_id, order_id
 
 
 def get_payment_intent(order_id: str) -> Optional[dict[str, Any]]:
     """Returns one payment intent with decoded JSON fields."""
     with get_db() as conn:
-        try:
-            row = conn.execute(
-                """
-                SELECT p.*, t.name AS tariff_name, t.duration_days,
-                       t.price_rub AS tariff_price_rub,
-                       t.price_minor AS tariff_price_minor
-                FROM payments p
-                LEFT JOIN tariffs t ON t.id = p.tariff_id
-                WHERE p.order_id = ?
-                """,
-                (str(order_id),),
-            ).fetchone()
-        except sqlite3.OperationalError as error:
-            if 'price_minor' not in str(error):
-                raise
-            row = conn.execute(
-                """
-                SELECT p.*, t.name AS tariff_name, t.duration_days,
-                       t.price_rub AS tariff_price_rub
-                FROM payments p
-                LEFT JOIN tariffs t ON t.id = p.tariff_id
-                WHERE p.order_id = ?
-                """,
-                (str(order_id),),
-            ).fetchone()
+        row = conn.execute(
+            """
+            SELECT p.*, t.name AS tariff_name, t.duration_days,
+                   t.price_minor AS tariff_price_minor
+            FROM payments p
+            LEFT JOIN tariffs t ON t.id = p.tariff_id
+            WHERE p.order_id = ?
+            """,
+            (str(order_id),),
+        ).fetchone()
     return _decode_intent(row)
 
 
@@ -115,31 +148,22 @@ def update_payment_intent_quote(
     order_id: str,
     *,
     payment_type: str,
-    payable_amount_minor: int | None = None,
-    payable_amount_cents: int | None = None,
+    payable_amount_minor: int,
     charge_amount: str,
     charge_currency: str,
     rate_snapshot: Mapping[str, Any],
-    compatibility_amount_cents: int = 0,
-    compatibility_amount_stars: int = 0,
 ) -> bool:
     """Persists a provider quote without changing an already settled intent."""
-    raw_payable = payable_amount_minor if payable_amount_minor is not None else payable_amount_cents
-    payable = _non_negative_int(raw_payable, 'payable_amount_minor')
+    payable = _non_negative_int(payable_amount_minor, 'payable_amount_minor')
     with get_db() as conn:
         cursor = conn.execute(
             """
             UPDATE payments
             SET payment_type = ?,
-                payable_amount_cents = ?,
                 payable_amount_minor = ?,
                 charge_amount = ?,
                 charge_currency = ?,
-                rate_snapshot_json = ?,
-                amount_cents = ?,
-                amount_stars = ?,
-                final_amount_cents = ?,
-                final_amount_stars = ?
+                rate_snapshot_json = ?
             WHERE order_id = ?
               AND status = 'pending'
               AND intent_version = 1
@@ -148,14 +172,9 @@ def update_payment_intent_quote(
             (
                 str(payment_type),
                 payable,
-                payable,
                 str(charge_amount),
                 str(charge_currency).upper(),
                 _json_object(rate_snapshot),
-                _non_negative_int(compatibility_amount_cents, 'compatibility_amount_cents'),
-                _non_negative_int(compatibility_amount_stars, 'compatibility_amount_stars'),
-                _non_negative_int(compatibility_amount_cents, 'compatibility_amount_cents'),
-                _non_negative_int(compatibility_amount_stars, 'compatibility_amount_stars'),
                 str(order_id),
             ),
         )
@@ -256,6 +275,157 @@ def mark_payment_provider_confirmed(order_id: str) -> bool:
         return cursor.rowcount > 0
 
 
+def confirm_internal_payment_intent_settlement(
+    order_id: str,
+    *,
+    payment_type: str,
+    balance_deduct_minor: int | None = None,
+    rate_snapshot: Mapping[str, Any] | None = None,
+) -> bool:
+    """Durably settle a validated zero-payable free or full-balance intent."""
+    normalized_type = str(payment_type or '').strip().casefold()
+    if normalized_type not in {'promo_free', 'balance'}:
+        raise ValueError('payment_type must be promo_free or balance')
+    balance_deduct = _non_negative_int(
+        balance_deduct_minor or 0,
+        'balance_deduct_minor',
+    )
+    rate_snapshot_json = _json_object(rate_snapshot or {})
+    with get_db() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE payments
+            SET payment_type = ?,
+                balance_deduct_minor = CASE
+                    WHEN ? = 'balance' THEN ? ELSE balance_deduct_minor
+                END,
+                payable_amount_minor = CASE
+                    WHEN ? = 'balance' THEN 0 ELSE payable_amount_minor
+                END,
+                charge_amount = CASE
+                    WHEN ? = 'balance' THEN '0' ELSE charge_amount
+                END,
+                charge_currency = CASE
+                    WHEN ? = 'balance' THEN base_currency ELSE charge_currency
+                END,
+                rate_snapshot_json = CASE
+                    WHEN ? = 'balance' THEN ? ELSE rate_snapshot_json
+                END,
+                provider_confirmed_at = COALESCE(
+                    provider_confirmed_at,
+                    CURRENT_TIMESTAMP
+                ),
+                fulfillment_status = 'provider_succeeded',
+                fulfillment_last_error = NULL
+            WHERE order_id = ?
+              AND status = 'pending'
+              AND intent_version = 1
+              AND (
+                    provider_confirmed_at IS NULL
+                    OR payment_type = ?
+              )
+              AND fulfillment_status IN ('pending', 'failed', 'provider_succeeded')
+              AND (
+                    ? <> 'balance'
+                    OR EXISTS (
+                        SELECT 1
+                        FROM users u
+                        WHERE u.id = payments.user_id
+                          AND COALESCE(u.personal_balance, 0) >= ? + COALESCE((
+                                SELECT SUM(COALESCE(reserved.balance_deduct_minor, 0))
+                                FROM payments reserved
+                                WHERE reserved.user_id = payments.user_id
+                                  AND reserved.order_id <> payments.order_id
+                                  AND reserved.status = 'pending'
+                                  AND reserved.provider_confirmed_at IS NOT NULL
+                                  AND reserved.fulfillment_status IN (
+                                        'provider_succeeded', 'failed', 'processing'
+                                  )
+                                  AND COALESCE(reserved.balance_deduct_minor, 0) > 0
+                                  AND NOT EXISTS (
+                                        SELECT 1
+                                        FROM payment_effects effect
+                                        WHERE effect.order_id = reserved.order_id
+                                          AND effect.effect_name = 'balance_debit'
+                                          AND effect.status = 'completed'
+                                  )
+                          ), 0)
+                    )
+              )
+              AND (
+                    (
+                        ? = 'promo_free'
+                        AND COALESCE(payable_amount_minor, 0) = 0
+                    )
+                    OR (
+                        ? = 'balance'
+                        AND purpose <> 'balance_topup'
+                        AND ? > 0
+                        AND COALESCE(payable_amount_minor, 0) > 0
+                        AND ? >= COALESCE(payable_amount_minor, 0)
+                    )
+              )
+            """,
+            (
+                normalized_type,
+                normalized_type,
+                balance_deduct,
+                normalized_type,
+                normalized_type,
+                normalized_type,
+                normalized_type,
+                rate_snapshot_json,
+                str(order_id),
+                normalized_type,
+                normalized_type,
+                balance_deduct,
+                normalized_type,
+                normalized_type,
+                balance_deduct,
+                balance_deduct,
+            ),
+        )
+        if cursor.rowcount > 0:
+            return True
+        row = conn.execute(
+            """
+            SELECT status, fulfillment_status, payment_type,
+                   provider_confirmed_at,
+                   payable_amount_minor, balance_deduct_minor
+            FROM payments
+            WHERE order_id = ? AND intent_version = 1
+            """,
+            (str(order_id),),
+        ).fetchone()
+        if row is None or str(row['payment_type'] or '') != normalized_type:
+            return False
+        stored_payable = int(row['payable_amount_minor'] or 0)
+        stored_balance_deduct = int(row['balance_deduct_minor'] or 0)
+        same_snapshot = bool(
+            stored_payable == 0
+            and (
+                normalized_type == 'promo_free'
+                or (
+                    balance_deduct > 0
+                    and stored_balance_deduct == balance_deduct
+                )
+            )
+        )
+        if not same_snapshot:
+            return False
+        return bool(
+            (
+                str(row['status'] or '') == 'paid'
+                and str(row['fulfillment_status'] or '') == 'completed'
+            )
+            or (
+                str(row['status'] or '') == 'pending'
+                and str(row['fulfillment_status'] or '') == 'provider_succeeded'
+                and row['provider_confirmed_at'] is not None
+            )
+        )
+
+
 def begin_payment_fulfillment(order_id: str) -> bool:
     """Atomically claims a provider-confirmed intent for one dispatcher."""
     with get_db() as conn:
@@ -334,6 +504,51 @@ def prepare_failed_payment_fulfillment_retry(order_id: str) -> bool:
             (str(order_id),),
         )
         return cursor.rowcount > 0
+
+
+def get_retryable_confirmed_payment_intents(
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Return settled v1 intents whose durable core fulfillment is incomplete."""
+    try:
+        normalized_limit = int(limit)
+    except (TypeError, ValueError):
+        normalized_limit = 10
+    normalized_limit = max(1, min(normalized_limit, 100))
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.order_id, p.payment_type, p.fulfillment_status,
+                   p.fulfillment_started_at, p.fulfillment_attempts,
+                   p.provider_confirmed_at, ppo.provider_id
+            FROM payments p
+            LEFT JOIN payment_provider_orders ppo ON ppo.order_id = p.order_id
+            WHERE p.intent_version = 1
+              AND p.status = 'pending'
+              AND p.provider_confirmed_at IS NOT NULL
+              AND p.fulfillment_status IN (
+                    'provider_succeeded', 'failed', 'processing'
+              )
+              AND (
+                    ppo.status = 'succeeded'
+                    OR (
+                        ppo.id IS NULL
+                        AND p.payment_type IN ('promo_free', 'balance')
+                    )
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM payment_auto_checks pac
+                    WHERE pac.order_id = p.order_id
+                      AND pac.state IN ('active', 'provider_succeeded')
+              )
+            ORDER BY p.provider_confirmed_at ASC, p.id ASC
+            LIMIT ?
+            """,
+            (normalized_limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def recover_interrupted_payment_fulfillment(
@@ -673,15 +888,11 @@ def fulfill_balance_topup_once(
     order_id: str,
     *,
     user_id: int,
-    amount_minor: int | None = None,
-    amount_cents: int | None = None,
+    amount_minor: int,
     currency: str = 'RUB',
 ) -> dict[str, Any]:
     """Credits one nominal top-up atomically with its unique history/effect rows."""
-    amount = _non_negative_int(
-        amount_minor if amount_minor is not None else amount_cents,
-        'amount_minor',
-    )
+    amount = _non_negative_int(amount_minor, 'amount_minor')
     operation_currency = str(currency or 'RUB').upper()
     if amount <= 0:
         return {'ok': False, 'reason': 'amount_must_be_positive'}
@@ -796,20 +1007,15 @@ def _decode_intent(row: Any) -> dict[str, Any] | None:
         return None
     data = dict(row)
     data['base_currency'] = str(data.get('base_currency') or 'RUB').upper()
-    data['nominal_amount_minor'] = int(
-        data.get('nominal_amount_minor') or data.get('nominal_amount_cents') or 0
-    )
-    data['payable_amount_minor'] = int(
-        data.get('payable_amount_minor') or data.get('payable_amount_cents') or 0
-    )
-    data['balance_deduct_minor'] = int(
-        data.get('balance_deduct_minor') or data.get('balance_deduct_cents') or 0
-    )
+    data['nominal_amount_minor'] = int(data.get('nominal_amount_minor') or 0)
+    data['payable_amount_minor'] = int(data.get('payable_amount_minor') or 0)
+    data['balance_deduct_minor'] = int(data.get('balance_deduct_minor') or 0)
     for source, target in (
         ('purpose_data_json', 'purpose_data'),
         ('rate_snapshot_json', 'rate_snapshot'),
         ('success_target_json', 'success_target'),
         ('cancel_target_json', 'cancel_target'),
+        ('origin_context_json', 'origin_context_payload'),
     ):
         raw = data.get(source)
         try:
@@ -817,7 +1023,30 @@ def _decode_intent(row: Any) -> dict[str, Any] | None:
         except (TypeError, json.JSONDecodeError):
             decoded = {}
         data[target] = decoded if isinstance(decoded, dict) else {}
+    if data.get('origin_extension_id'):
+        data['origin_context'] = {
+            'owner_extension_id': str(data['origin_extension_id']),
+            'schema_version': int(data.get('origin_context_version') or 0),
+            'payload': data.get('origin_context_payload') or {},
+            'workflow_id': str(data.get('origin_workflow_id') or ''),
+            'completion_handler': (
+                str(data['origin_completion_handler'])
+                if data.get('origin_completion_handler')
+                else None
+            ),
+        }
+    else:
+        data['origin_context'] = None
     return data
+
+
+def _normalize_payment_origin_context(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    from bot.utils.action_origin_context import normalize_stored_origin_context
+
+    normalized = normalize_stored_origin_context(value)
+    return normalized.as_storage_dict() if normalized is not None else None
 
 
 def _json_object(value: Mapping[str, Any]) -> str:
@@ -841,6 +1070,7 @@ __all__ = [
     'claim_payment_effect',
     'complete_payment_effect',
     'complete_payment_fulfillment',
+    'confirm_internal_payment_intent_settlement',
     'create_payment_intent_record',
     'fail_payment_effect',
     'fail_payment_fulfillment',
@@ -848,6 +1078,7 @@ __all__ = [
     'fulfill_key_purchase_once',
     'fulfill_key_renewal_once',
     'get_payment_intent',
+    'get_retryable_confirmed_payment_intents',
     'is_payment_effect_completed',
     'mark_payment_provider_confirmed',
     'prepare_failed_payment_fulfillment_retry',

@@ -269,6 +269,14 @@ def key_action_cancel_kb(key_id: int, user_telegram_id: int) -> InlineKeyboardMa
     builder.row(InlineKeyboardButton(text='❌ Отмена', callback_data=f'admin_key_view:{key_id}'))
     return builder.as_markup()
 
+
+def key_action_back_kb(key_id: int) -> InlineKeyboardMarkup:
+    """Back navigation for a one-value key action."""
+    builder = InlineKeyboardBuilder()
+    builder.row(back_button(f'admin_key_view:{key_id}'))
+    return builder.as_markup()
+
+
 def key_delete_confirm_kb(key_id: int, user_telegram_id: int) -> InlineKeyboardMarkup:
     """Keypad to confirm key deletion."""
     builder = InlineKeyboardBuilder()

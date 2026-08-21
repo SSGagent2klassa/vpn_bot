@@ -19,6 +19,7 @@ from config import RETRY_CONFIG
 
 from bot.utils.inbounds import filter_visible_inbounds, is_mtproto_inbound
 from bot.utils.panel_version import (
+    CLIENT_EXTERNAL_LINKS_MIN_VERSION,
     MINIMUM_SUPPORTED_3X_UI_VERSION,
     panel_version_at_least,
     parse_panel_version,
@@ -42,6 +43,7 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_PANEL_TIMEOUT_SECONDS = 15
+CAPABILITY_REFRESH_INTERVAL_SECONDS = 300
 BOT_API_TOKEN_NAME = "YadrenoVPN Bot"
 MTPROTO_MULTI_CLIENT_MIN_VERSION = (3, 5, 0)
 JSON_INBOUND_FIELDS = ("settings", "streamSettings", "sniffing")
@@ -67,6 +69,8 @@ class XUIClient(BaseVPNClient):
         self._validated_token: Optional[str] = None
         self._session_lock = asyncio.Lock()
         self._auth_lock = asyncio.Lock()
+        self._capability_refresh_lock = asyncio.Lock()
+        self._capability_checked_monotonic = 0.0
         self._panel_settings: Optional[Dict[str, Any]] = None
         self._operation_metrics: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
             contextvars.ContextVar(f"xui_operation_metrics_{id(self)}", default=None)
@@ -407,6 +411,7 @@ class XUIClient(BaseVPNClient):
     def _persist_panel_version(self, version: str) -> None:
         self.panel_version = version
         self.server["panel_version"] = version
+        self._capability_checked_monotonic = time.monotonic()
         if self.server_id is not None:
             from database.db_servers import update_server_panel_info
 
@@ -623,6 +628,43 @@ class XUIClient(BaseVPNClient):
         except PanelRequestError as error:
             self._log_failure(error)
             raise
+
+    def _capability_refresh_is_fresh(self) -> bool:
+        checked_at = float(self._capability_checked_monotonic or 0.0)
+        return bool(
+            checked_at
+            and time.monotonic() - checked_at < CAPABILITY_REFRESH_INTERVAL_SECONDS
+        )
+
+    async def refresh_capabilities(self) -> bool:
+        """Refresh the live panel version with a short per-client TTL."""
+        await self.login()
+        if self._capability_refresh_is_fresh():
+            return True
+        async with self._capability_refresh_lock:
+            if self._capability_refresh_is_fresh():
+                return True
+            payload = await self._request("GET", "/panel/api/server/status")
+            version = self._extract_version(payload)
+            if version is None:
+                payload = await self._request(
+                    "GET",
+                    "/panel/api/server/getPanelUpdateInfo",
+                )
+                version = self._extract_version(payload)
+            if version is None or not panel_version_at_least(
+                version,
+                MINIMUM_SUPPORTED_3X_UI_VERSION,
+            ):
+                raise PanelRequestError(
+                    PanelErrorKind.UNSUPPORTED_VERSION,
+                    endpoint="/panel/api/server/getPanelUpdateInfo",
+                    detail=(
+                        f"detected version={version or 'unknown'}; minimum=3.3.0"
+                    ),
+                )
+            self._persist_panel_version(version)
+            return True
 
     async def _request(
         self,
@@ -1109,7 +1151,46 @@ class XUIClient(BaseVPNClient):
         endpoint = f"/panel/api/clients/update/{encoded}"
         if inbound_ids:
             endpoint += "?inboundIds=" + ",".join(str(value) for value in sorted(inbound_ids))
-        await self._request("POST", endpoint, data=payload)
+
+        def update_confirmed(value: Optional[Dict[str, Any]]) -> bool:
+            if not value:
+                return False
+            confirmed, confirmed_inbound_ids = self._split_record(value)
+            if inbound_ids and not inbound_ids.issubset(confirmed_inbound_ids):
+                return False
+            checks = (
+                (self._int(confirmed.get("totalGB")), self._int(payload.get("totalGB"))),
+                (self._int(confirmed.get("expiryTime")), self._int(payload.get("expiryTime"))),
+                (
+                    self._api_bool(confirmed.get("enable"), True),
+                    self._api_bool(payload.get("enable"), True),
+                ),
+                (
+                    self._int(confirmed.get("limitIp"), 1),
+                    self._int(payload.get("limitIp"), 1),
+                ),
+                (str(confirmed.get("subId") or ""), str(payload.get("subId") or "")),
+                (self._int(confirmed.get("reset")), self._int(payload.get("reset"))),
+            )
+            if any(actual != expected for actual, expected in checks):
+                return False
+            if flow is not None or "flow" in payload:
+                return str(confirmed.get("flow") or "") == str(payload.get("flow") or "")
+            return True
+
+        confirmed_record = await self._write_with_state_check(
+            "POST",
+            endpoint,
+            data=payload,
+            email=email,
+            validator=update_confirmed,
+        )
+        if not update_confirmed(confirmed_record):
+            raise PanelRequestError(
+                PanelErrorKind.INVALID_RESPONSE,
+                endpoint=endpoint,
+                detail="client update was not confirmed",
+            )
         return True
 
     async def provision_client(
@@ -1527,6 +1608,81 @@ class XUIClient(BaseVPNClient):
 
     async def get_subscription_link(self, sub_id: str) -> Optional[str]:
         return await self.build_subscription_url(sub_id)
+
+    def supports_client_external_links(self) -> bool:
+        """Return whether the detected panel exposes per-client external links."""
+        return panel_version_at_least(
+            self.panel_version,
+            CLIENT_EXTERNAL_LINKS_MIN_VERSION,
+        )
+
+    async def get_client_external_links(self, email: str) -> List[Dict[str, Any]]:
+        """Read the complete external-link collection for one logical client."""
+        if not self.supports_client_external_links():
+            raise PanelRequestError(
+                PanelErrorKind.UNSUPPORTED_API,
+                endpoint="/panel/api/clients/:email/externalLinks",
+                detail="client external links require 3X-UI 3.4.0+",
+            )
+        normalized_email = str(email or "").strip()
+        if not normalized_email:
+            raise ValueError("email is required")
+        record = await self._get_client_record(normalized_email)
+        if record is None:
+            raise PanelRequestError(
+                PanelErrorKind.INVALID_RESPONSE,
+                endpoint="/panel/api/clients/get/:email",
+                detail="client record is absent",
+            )
+        raw_links: Any = record.get("externalLinks", [])
+        if isinstance(raw_links, str):
+            try:
+                raw_links = json.loads(raw_links)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise PanelRequestError(
+                    PanelErrorKind.INVALID_RESPONSE,
+                    endpoint="/panel/api/clients/get/:email",
+                    detail="client externalLinks is not valid JSON",
+                ) from exc
+        if raw_links is None:
+            raw_links = []
+        if not isinstance(raw_links, list) or any(
+            not isinstance(item, dict) for item in raw_links
+        ):
+            raise PanelRequestError(
+                PanelErrorKind.INVALID_RESPONSE,
+                endpoint="/panel/api/clients/get/:email",
+                detail="client externalLinks is not a list of objects",
+            )
+        return [dict(item) for item in raw_links]
+
+    async def replace_client_external_links(
+        self,
+        email: str,
+        links: Iterable[Dict[str, Any]],
+    ) -> bool:
+        """Replace all external links after callers have merged foreign rows."""
+        if not self.supports_client_external_links():
+            raise PanelRequestError(
+                PanelErrorKind.UNSUPPORTED_API,
+                endpoint="/panel/api/clients/:email/externalLinks",
+                detail="client external links require 3X-UI 3.4.0+",
+            )
+        normalized_email = str(email or "").strip()
+        if not normalized_email:
+            raise ValueError("email is required")
+        normalized_links: List[Dict[str, Any]] = []
+        for item in links:
+            if not isinstance(item, dict):
+                raise ValueError("external link rows must be objects")
+            normalized_links.append(dict(item))
+        encoded = urllib.parse.quote(normalized_email, safe="")
+        await self._request(
+            "POST",
+            f"/panel/api/clients/{encoded}/externalLinks",
+            data={"externalLinks": normalized_links},
+        )
+        return True
 
     @staticmethod
     def _detect_database_backup(data: bytes) -> Optional[PanelDatabaseBackup]:

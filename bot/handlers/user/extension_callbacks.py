@@ -5,8 +5,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from aiogram import F, Router
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
 
+from bot.utils.action_dispatcher import apply_extension_callback_result
 from bot.utils.extension_callbacks import (
     EXT_CALLBACK_PREFIX,
     dispatch_extension_callback,
@@ -21,7 +23,7 @@ router = Router()
 
 
 @router.callback_query(F.data.startswith(EXT_CALLBACK_PREFIX))
-async def extension_callback_handler(callback: CallbackQuery) -> None:
+async def extension_callback_handler(callback: CallbackQuery, state: FSMContext) -> None:
     """Executes a registered extension callback without passing the raw Telegram API."""
     telegram_id = callback.from_user.id
     if is_user_banned(telegram_id):
@@ -40,6 +42,18 @@ async def extension_callback_handler(callback: CallbackQuery) -> None:
         'telegram_id': telegram_id,
     }
     result = await dispatch_extension_callback(context, bot=callback.bot)
+
+    if result.get('target') == 'core_action':
+        await apply_extension_callback_result(
+            callback,
+            result,
+            parsed['extension_id'],
+            parsed['action_name'],
+            parsed['payload'],
+            source='callback',
+            state=state,
+        )
+        return
 
     render_context = {
         'telegram_id': telegram_id,

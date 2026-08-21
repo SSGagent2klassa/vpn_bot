@@ -9,10 +9,9 @@ from typing import Any, Mapping
 
 from database.requests import (
     cancel_pending_order,
-    find_order_by_order_id,
     get_due_payment_auto_checks,
     get_payment_auto_check,
-    get_retryable_confirmed_payment_provider_orders,
+    get_retryable_confirmed_payment_intents,
     record_payment_auto_check_attempt,
     record_payment_completion_attempt,
     update_payment_auto_check,
@@ -27,14 +26,6 @@ AUTO_CHECK_BATCH_LIMIT = 10
 AUTO_CHECK_CONCURRENCY = 3
 COMPLETION_RETRY_DELAYS_SECONDS = (60, 120)
 COMPLETION_MAX_ATTEMPTS = 3
-
-_BUILTIN_CHECKS = {
-    'yookassa_qr': ('yookassa_payment_id', 'check_yookassa_payment_status'),
-    'wata': ('wata_link_id', 'check_wata_payment_status'),
-    'platega': ('platega_transaction_id', 'check_platega_payment_status'),
-    'cardlink': ('cardlink_bill_id', 'check_cardlink_payment_status'),
-}
-
 
 async def auto_check_payment_orders(
     *,
@@ -73,7 +64,7 @@ async def retry_confirmed_payment_intents(
     concurrency: int = AUTO_CHECK_CONCURRENCY,
 ) -> dict[str, int]:
     """Retries settled v1 intents that are not owned by an active polling row."""
-    rows = get_retryable_confirmed_payment_provider_orders(
+    rows = get_retryable_confirmed_payment_intents(
         limit=min(max(1, int(limit)), AUTO_CHECK_BATCH_LIMIT)
     )
     summary = {'queued': 0, 'completed': 0, 'pending': 0, 'errors': 0}
@@ -94,7 +85,6 @@ async def retry_confirmed_payment_intents(
                     bot=bot,
                     background=True,
                     notify_user=True,
-                    retry_post_actions=True,
                 )
                 if result.ok:
                     summary['completed'] += 1
@@ -197,13 +187,10 @@ async def _process_due_row(bot: Any, row: Mapping[str, Any]) -> str:
         return await _complete_confirmed_queue_row(bot, current)
 
     if status == 'canceled':
-        order = find_order_by_order_id(order_id)
-        if not order or int(order.get('intent_version') or 0) != 1:
-            cancel_pending_order(order_id)
-        else:
-            from database.requests import update_payment_provider_order_status
+        from database.requests import update_payment_provider_order_status
 
-            update_payment_provider_order_status(order_id, 'canceled')
+        update_payment_provider_order_status(order_id, 'canceled')
+        cancel_pending_order(order_id)
         update_payment_auto_check(
             order_id,
             state='canceled',
@@ -243,35 +230,14 @@ async def _process_due_row(bot: Any, row: Mapping[str, Any]) -> str:
 
 
 async def _check_provider_status(row: Mapping[str, Any]) -> str:
-    payment_type = str(row.get('payment_type') or '')
     order_id = str(row.get('order_id') or '')
-    if int(row.get('intent_version') or 0) == 1:
-        from bot.services.payment_intents import load_payment_intent
-        from bot.services.payment_provider_adapters import check_provider_invoice
+    from bot.services.payment_intents import load_payment_intent
+    from bot.services.payment_provider_adapters import check_provider_invoice
 
-        intent = load_payment_intent(order_id)
-        if intent is None:
-            raise ValueError('Payment intent not found')
-        return await check_provider_invoice(intent)
-
-    builtin = _BUILTIN_CHECKS.get(payment_type)
-    if builtin:
-        from bot.services import billing
-
-        field_name, function_name = builtin
-        external_id = row.get(field_name)
-        if not external_id:
-            raise ValueError(f'В ордере отсутствует {field_name}')
-        check_function = getattr(billing, function_name)
-        return str(await check_function(str(external_id), order_id=order_id))
-
-    from bot.services.custom_payments import check_custom_payment_order
-
-    order = find_order_by_order_id(order_id)
-    if not order:
-        raise ValueError('Ордер не найден')
-    result = await check_custom_payment_order(str(row.get('provider_id') or ''), order)
-    return str(result.get('status') or 'pending')
+    intent = load_payment_intent(order_id)
+    if intent is None:
+        raise ValueError('Payment intent not found')
+    return await check_provider_invoice(intent)
 
 
 def _next_check_delay(row: Mapping[str, Any], completed_attempts: int) -> int | None:
@@ -348,9 +314,6 @@ async def _complete_confirmed_queue_row(bot: Any, row: Mapping[str, Any]) -> str
             background=True,
             notify_user=True,
             show_primary_result=attempt_no == 1,
-            retry_post_actions=(
-                attempt_no > 1 or str(row.get('order_status') or '') == 'paid'
-            ),
         )
         if not result.ok:
             if not result.retryable:
@@ -482,6 +445,31 @@ async def run_payment_auto_check_scheduler(bot: Any) -> None:
             raise
         except Exception as error:
             logger.error("Ошибка scheduler автопроверки API-платежей: %s", error, exc_info=True)
+        try:
+            from bot.services.extension_completion import (
+                process_due_extension_completions,
+            )
+            from database.requests import expire_semantic_action_contexts
+
+            expired_contexts = expire_semantic_action_contexts()
+            completion_summary = await process_due_extension_completions(bot=bot)
+            if (
+                completion_summary['queued']
+                or completion_summary['promoted']
+                or expired_contexts
+            ):
+                logger.info(
+                    'Extension completion deliveries: %s expired_contexts=%s',
+                    completion_summary,
+                    expired_contexts,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.error(
+                'Extension completion scheduler tick failed type=%s',
+                type(error).__name__,
+            )
         await asyncio.sleep(60)
 
 

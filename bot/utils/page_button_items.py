@@ -13,6 +13,7 @@ def build_tariff_button_items(
     *,
     key_id: int | None = None,
     user_id: int | None = None,
+    action_context_token: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return tariff data/actions; the visible label remains page-owned."""
     discount_percent = 0
@@ -23,10 +24,7 @@ def build_tariff_button_items(
 
     items: list[dict[str, Any]] = []
     for tariff in tariffs:
-        price_minor = int(
-            tariff.get('price_minor')
-            or int(float(tariff.get('price_rub') or 0) * 100)
-        )
+        price_minor = int(tariff.get('price_minor') or 0)
         if price_minor <= 0:
             continue
         tariff_id = int(tariff['id'])
@@ -44,10 +42,13 @@ def build_tariff_button_items(
                     f"{price_text} → "
                     f"{format_money_minor(discounted_minor, currency)}"
                 )
+        callback_data = (
+            f"payment_intent_tariff:{purpose}:{tariff_id}:{int(key_id or 0)}"
+        )
+        if action_context_token is not None:
+            callback_data = f'{callback_data}:{action_context_token}'
         items.append({
-            'callback_data': (
-                f"payment_intent_tariff:{purpose}:{tariff_id}:{int(key_id or 0)}"
-            ),
+            'callback_data': callback_data,
             'data': {
                 'item_name': str(tariff.get('name') or tariff_id),
                 'item_price': price_text,
@@ -98,8 +99,43 @@ def build_key_button_items(keys: Iterable[Mapping[str, Any]]) -> list[dict[str, 
     return items
 
 
+def build_subscription_host_button_items(
+    hosts: Iterable[Mapping[str, Any]],
+    *,
+    component_key_id: int,
+) -> list[dict[str, Any]]:
+    """Return eligible host-key actions while the page owns their labels."""
+    component_id = int(component_key_id)
+    items: list[dict[str, Any]] = []
+    for host in hosts:
+        raw_host_id = host.get('id', host.get('key_id'))
+        if raw_host_id is None:
+            continue
+        host_id = int(raw_host_id)
+        display_name = host.get('display_name') or host.get('custom_name')
+        if not display_name:
+            identity_parts = [
+                str(value)
+                for value in (
+                    host.get('tariff_name'),
+                    host.get('server_name'),
+                    f'#{host_id}',
+                )
+                if value
+            ]
+            display_name = ' · '.join(identity_parts)
+        items.append({
+            'callback_data': (
+                f'subscription_host_select:{component_id}:{host_id}'
+            ),
+            'data': {'item_name': str(display_name)},
+        })
+    return items
+
+
 __all__ = [
     'build_key_button_items',
     'build_server_button_items',
+    'build_subscription_host_button_items',
     'build_tariff_button_items',
 ]

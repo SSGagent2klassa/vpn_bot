@@ -356,6 +356,26 @@ class BaseVPNClient(abc.ABC):
     async def get_subscription_link(self, sub_id: str) -> Optional[str]:
         pass
 
+    async def refresh_capabilities(self) -> bool:
+        """Refresh capability metadata before a capability-gated mutation."""
+        return bool(await self.login())
+
+    def supports_client_external_links(self) -> bool:
+        """Return whether this panel can compose client subscription feeds."""
+        return False
+
+    async def get_client_external_links(self, email: str) -> List[Dict[str, Any]]:
+        """Return the complete external-link list for one logical client."""
+        raise NotImplementedError("Client external links are not supported")
+
+    async def replace_client_external_links(
+        self,
+        email: str,
+        links: Iterable[Dict[str, Any]],
+    ) -> bool:
+        """Replace the complete external-link list for one logical client."""
+        raise NotImplementedError("Client external links are not supported")
+
     @abc.abstractmethod
     async def get_database_backup(self) -> PanelDatabaseBackup:
         pass

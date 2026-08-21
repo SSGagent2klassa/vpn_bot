@@ -1,4 +1,7 @@
+import asyncio
 import logging
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from aiogram import Bot
@@ -10,6 +13,8 @@ from database.requests import (
     get_support_admin_notifications,
     get_support_claim_cleanup_mode,
     mark_support_admin_notifications_inactive,
+    save_support_admin_notification_delivery,
+    set_support_message_delivery,
 )
 from bot.keyboards.support import admin_support_reply_kb
 from bot.utils.page_renderer import (
@@ -22,6 +27,31 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_SUPPORT_MEDIA_TYPES = {"text", "photo", "video", "animation"}
 SUPPORT_REPLY_PAGE_KEY = "support_reply"
+
+
+@dataclass
+class _SupportThreadLock:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
+_SUPPORT_THREAD_LOCKS: Dict[int, _SupportThreadLock] = {}
+
+
+@asynccontextmanager
+async def support_thread_operation(thread_id: int):
+    """Serializes message writes/delivery and status changes for one thread."""
+    if isinstance(thread_id, bool) or not isinstance(thread_id, int) or thread_id <= 0:
+        raise ValueError("thread_id must be a positive integer")
+    entry = _SUPPORT_THREAD_LOCKS.setdefault(thread_id, _SupportThreadLock())
+    entry.users += 1
+    try:
+        async with entry.lock:
+            yield
+    finally:
+        entry.users -= 1
+        if entry.users == 0 and _SUPPORT_THREAD_LOCKS.get(thread_id) is entry:
+            _SUPPORT_THREAD_LOCKS.pop(thread_id, None)
 
 
 def extract_support_payload(message: Message) -> Optional[Dict[str, Any]]:
@@ -181,15 +211,94 @@ async def send_user_message_to_admins(
     return {"sent": sent, "failed": failed}
 
 
-async def send_admin_message_to_user(
+async def send_generated_user_message_to_admins(
     bot: Bot,
     *,
     thread: Dict[str, Any],
-    source_message: Message,
-) -> Optional[int]:
-    """Sends a copy of the admin message to the user with a reply button."""
-    thread_id = int(thread["id"])
-    user_telegram_id = int(thread["user_telegram_id"])
+    user: Dict[str, Any],
+    support_message_id: int,
+    text_html: str,
+) -> Dict[str, int | str]:
+    """Delivers an extension-origin user message without duplicating completed sends."""
+    existing = get_support_admin_notifications(
+        int(thread["id"]),
+        active_only=False,
+        support_message_id=int(support_message_id),
+    )
+    deliveries = {
+        int(item["admin_telegram_id"]): item
+        for item in existing
+    }
+    recipients = sorted({int(admin_id) for admin_id in ADMIN_IDS})
+    sent = 0
+    failed = 0
+
+    for admin_id in recipients:
+        delivery = deliveries.get(admin_id, {})
+        copy_message_id = delivery.get("copy_message_id")
+        card_message_id = delivery.get("card_message_id")
+        try:
+            if not copy_message_id:
+                delivered = await send_media_or_text(
+                    bot,
+                    chat_id=admin_id,
+                    text=text_html,
+                )
+                copy_message_id = getattr(delivered, "message_id", None)
+                delivery = save_support_admin_notification_delivery(
+                    int(thread["id"]),
+                    admin_id,
+                    support_message_id=int(support_message_id),
+                    copy_message_id=copy_message_id,
+                )
+
+            if not card_message_id:
+                card = await send_media_or_text(
+                    bot,
+                    chat_id=admin_id,
+                    text=format_admin_support_card(
+                        title="Новое обращение в поддержку",
+                        thread=thread,
+                        user=user,
+                        assigned_admin_id=None,
+                    ),
+                    reply_markup=admin_support_reply_kb(int(thread["id"])),
+                )
+                card_message_id = getattr(card, "message_id", None)
+                delivery = save_support_admin_notification_delivery(
+                    int(thread["id"]),
+                    admin_id,
+                    support_message_id=int(support_message_id),
+                    card_message_id=card_message_id,
+                    copy_message_id=copy_message_id,
+                )
+
+            if delivery.get("copy_message_id") and delivery.get("card_message_id"):
+                sent += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            logger.warning(
+                "Failed to deliver generated support message %s to admin %s: %s",
+                support_message_id,
+                admin_id,
+                exc,
+            )
+            failed += 1
+
+    return {
+        "sent": sent,
+        "failed": failed,
+        "status": _delivery_status(sent=sent, failed=failed),
+    }
+
+
+async def _prepare_support_reply_markup(
+    bot: Bot,
+    *,
+    thread_id: int,
+    user_telegram_id: int,
+):
     prepared = await prepare_page_render(
         bot,
         SUPPORT_REPLY_PAGE_KEY,
@@ -199,9 +308,24 @@ async def send_admin_message_to_user(
         },
     )
     if isinstance(prepared, PreparedPageRender) and prepared.page_key == SUPPORT_REPLY_PAGE_KEY:
-        reply_markup = prepared.reply_markup
-    else:
-        reply_markup = None
+        return prepared.reply_markup
+    return None
+
+
+async def send_admin_message_to_user(
+    bot: Bot,
+    *,
+    thread: Dict[str, Any],
+    source_message: Message,
+) -> Optional[int]:
+    """Sends a copy of the admin message to the user with a reply button."""
+    thread_id = int(thread["id"])
+    user_telegram_id = int(thread["user_telegram_id"])
+    reply_markup = await _prepare_support_reply_markup(
+        bot,
+        thread_id=thread_id,
+        user_telegram_id=user_telegram_id,
+    )
 
     return await copy_support_message(
         bot,
@@ -209,6 +333,54 @@ async def send_admin_message_to_user(
         source_message=source_message,
         reply_markup=reply_markup,
     )
+
+
+async def send_generated_admin_message_to_user(
+    bot: Bot,
+    *,
+    thread: Dict[str, Any],
+    message: Dict[str, Any],
+) -> Dict[str, int | str]:
+    """Delivers one extension-origin admin-side message to its support user."""
+    delivered_message_id = message.get("delivered_message_id")
+    if delivered_message_id:
+        return {"sent": 1, "failed": 0, "status": "sent"}
+
+    thread_id = int(thread["id"])
+    user_telegram_id = int(thread["user_telegram_id"])
+    reply_markup = await _prepare_support_reply_markup(
+        bot,
+        thread_id=thread_id,
+        user_telegram_id=user_telegram_id,
+    )
+    try:
+        delivered = await send_media_or_text(
+            bot,
+            chat_id=user_telegram_id,
+            text=str(message.get("text_html") or ""),
+            reply_markup=reply_markup,
+        )
+        telegram_message_id = getattr(delivered, "message_id", None)
+        if telegram_message_id is None:
+            return {"sent": 0, "failed": 1, "status": "failed"}
+        set_support_message_delivery(int(message["id"]), int(telegram_message_id))
+        return {"sent": 1, "failed": 0, "status": "sent"}
+    except Exception as exc:
+        logger.warning(
+            "Failed to deliver generated support message %s to user %s: %s",
+            message.get("id"),
+            user_telegram_id,
+            exc,
+        )
+        return {"sent": 0, "failed": 1, "status": "failed"}
+
+
+def _delivery_status(*, sent: int, failed: int) -> str:
+    if sent and failed:
+        return "partial"
+    if sent:
+        return "sent"
+    return "failed"
 
 
 async def cleanup_claimed_admin_notifications(

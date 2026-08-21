@@ -26,6 +26,10 @@ from database.requests import (
     update_tariff
 )
 from bot.utils.admin import is_admin
+from bot.utils.admin_dialog import (
+    render_admin_dialog,
+    render_admin_dialog_from_input,
+)
 from bot.utils.tariff_prices import format_tariff_price_display
 from bot.services.money import format_money_minor
 from bot.states.admin_states import (
@@ -47,7 +51,7 @@ from bot.keyboards.admin import (
 
 logger = logging.getLogger(__name__)
 
-from bot.utils.text import safe_edit_or_send
+from bot.utils.text import get_message_text_for_storage, safe_edit_or_send
 
 router = Router()
 
@@ -222,7 +226,7 @@ async def toggle_tariff(callback: CallbackQuery, state: FSMContext):
 # Add states are ok
 ADD_TARIFF_STATES = [
     AdminStates.add_tariff_name,
-    AdminStates.add_tariff_price_rub,
+    AdminStates.add_tariff_price,
     AdminStates.add_tariff_duration,
     AdminStates.add_tariff_traffic_limit,
     AdminStates.add_tariff_max_ips,
@@ -244,7 +248,7 @@ def get_add_step_state(step: int) -> AdminStates:
     
     state_map = {
         'name': AdminStates.add_tariff_name,
-        'price_minor': AdminStates.add_tariff_price_rub,
+        'price_minor': AdminStates.add_tariff_price,
         'duration_days': AdminStates.add_tariff_duration,
         'traffic_limit_gb': AdminStates.add_tariff_traffic_limit,
         'max_ips': AdminStates.add_tariff_max_ips,
@@ -254,7 +258,7 @@ def get_add_step_state(step: int) -> AdminStates:
     return state_map.get(key, AdminStates.add_tariff_confirm)
 
 
-def get_add_step_text(step: int, data: dict) -> str:
+def get_add_step_text(step: int, data: dict, *, error: str | None = None) -> str:
     """Generates text for the step of adding a tariff."""
     params = get_tariff_params_list()
     # Remove display_order from adding (it will be 0 by default)
@@ -265,8 +269,11 @@ def get_add_step_text(step: int, data: dict) -> str:
         return "Ошибка"
     
     param = params[step - 1]
-    
+
     lines = [f"📝 <b>Добавление тарифа ({step}/{total})</b>\n"]
+
+    if error:
+        lines.append(f"❌ {error}\n")
     
     # Showing already entered data
     for i in range(step - 1):
@@ -303,7 +310,7 @@ async def start_add_tariff(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.tariff_select_group)
         await state.update_data(tariff_data={})
         
-        await safe_edit_or_send(callback.message, 
+        await render_admin_dialog(callback.message, state,
             "📝 <b>Добавление тарифа</b>\n\n"
             "Выберите группу для нового тарифа:",
             reply_markup=group_select_kb(groups, "tariff_group_select", "admin_tariffs")
@@ -321,7 +328,7 @@ async def start_add_tariff(callback: CallbackQuery, state: FSMContext):
     
     text = get_add_step_text(1, {})
     
-    await safe_edit_or_send(callback.message, 
+    await render_admin_dialog(callback.message, state,
         text,
         reply_markup=add_tariff_step_kb(1, total)
     )
@@ -347,7 +354,7 @@ async def tariff_group_selected(callback: CallbackQuery, state: FSMContext):
     
     text = f"📂 Группа: <b>{group_name}</b>\n\n" + get_add_step_text(1, {})
     
-    await safe_edit_or_send(callback.message, 
+    await render_admin_dialog(callback.message, state,
         text,
         reply_markup=add_tariff_step_kb(1, total)
     )
@@ -381,7 +388,7 @@ async def add_tariff_back(callback: CallbackQuery, state: FSMContext):
     
     text = get_add_step_text(new_step, data.get('tariff_data', {}))
     
-    await safe_edit_or_send(callback.message, 
+    await render_admin_dialog(callback.message, state,
         text,
         reply_markup=add_tariff_step_kb(new_step, total)
     )
@@ -401,15 +408,16 @@ async def process_add_tariff_step(message: Message, state: FSMContext):
     if current_step > total:
         return
     
-    from bot.utils.text import get_message_text_for_storage, safe_edit_or_send
-    
     param = params[current_step - 1]
     value = get_message_text_for_storage(message, 'plain')
-    
+
     # Validation
     if not param['validate'](value):
-        await safe_edit_or_send(message,
-            f"❌ {param['error']}\n\nПопробуйте ещё раз:"
+        await render_admin_dialog_from_input(
+            message,
+            state,
+            get_add_step_text(current_step, tariff_data, error=param['error']),
+            reply_markup=add_tariff_step_kb(current_step, total),
         )
         return
     
@@ -421,12 +429,6 @@ async def process_add_tariff_step(message: Message, state: FSMContext):
     tariff_data[param['key']] = value
     await state.update_data(tariff_data=tariff_data)
     
-    # Delete the message
-    try:
-        await message.delete()
-    except:
-        pass
-    
     # Move to next step or confirmation
     if current_step < total:
         new_step = current_step + 1
@@ -436,10 +438,9 @@ async def process_add_tariff_step(message: Message, state: FSMContext):
         
         text = get_add_step_text(new_step, tariff_data)
         
-        await safe_edit_or_send(message,
+        await render_admin_dialog_from_input(message, state,
             text,
             reply_markup=add_tariff_step_kb(new_step, total),
-            force_new=True
         )
     else:
         # All data has been entered - we show confirmation
@@ -464,10 +465,9 @@ async def process_add_tariff_step(message: Message, state: FSMContext):
         
         lines.append("\nСохранить тариф?")
         
-        await safe_edit_or_send(message,
+        await render_admin_dialog_from_input(message, state,
             "\n".join(lines),
             reply_markup=add_tariff_confirm_kb(),
-            force_new=True
         )
 
 
@@ -477,8 +477,8 @@ async def add_tariff_name_handler(message: Message, state: FSMContext):
     await process_add_tariff_step(message, state)
 
 
-@router.message(AdminStates.add_tariff_price_rub)
-async def add_tariff_price_rub_handler(message: Message, state: FSMContext):
+@router.message(AdminStates.add_tariff_price)
+async def add_tariff_price_handler(message: Message, state: FSMContext):
     await process_add_tariff_step(message, state)
 
 
@@ -522,7 +522,7 @@ async def add_tariff_save(callback: CallbackQuery, state: FSMContext):
             max_ips=tariff_data.get('max_ips', 1)
         )
         
-        await safe_edit_or_send(callback.message, 
+        target = await render_admin_dialog(callback.message, state,
             f"✅ <b>Тариф успешно добавлен!</b>\n\n"
             f"📋 {tariff_data['name']}"
         )
@@ -531,11 +531,11 @@ async def add_tariff_save(callback: CallbackQuery, state: FSMContext):
         
         # Showing the tariff
         # Showing the tariff
-        await render_tariff_view(callback.message, tariff_id, state)
+        await render_tariff_view(target, tariff_id, state)
         
     except Exception as e:
         logger.error(f"Ошибка добавления тарифа: {e}")
-        await safe_edit_or_send(callback.message, 
+        await render_admin_dialog(callback.message, state,
             f"❌ <b>Ошибка сохранения</b>\n\n<code>{e}</code>",
             reply_markup=back_and_home_kb("admin_tariffs")
         )

@@ -11,12 +11,15 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     LabeledPrice,
+    Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.services.payment_intents import (
     PURPOSE_KEY_PURCHASE,
     PURPOSE_KEY_RENEWAL,
+    cancel_payment_intent,
+    confirm_internal_payment_settlement,
     create_payment_intent,
     format_base_minor,
     load_payment_intent,
@@ -48,8 +51,6 @@ from database.requests import (
     is_referral_enabled,
     get_referral_reward_type,
     save_payment_balance_deduction,
-    update_payment_type,
-    update_payment_intent_quote,
 )
 
 logger = logging.getLogger(__name__)
@@ -112,7 +113,7 @@ async def show_payment_method_select(
 
 async def start_payment_intent_method_selection(
     target,
-    state: FSMContext,
+    state: FSMContext | None,
     intent,
     *,
     telegram_id: int,
@@ -129,7 +130,20 @@ async def start_payment_intent_method_selection(
         await render_page(message, page_key="payment_unavailable")
         return False
     if preview.is_free:
-        update_payment_type(intent.order_id, 'promo_free')
+        if not confirm_internal_payment_settlement(
+            intent.order_id,
+            payment_type='promo_free',
+        ):
+            logger.error(
+                'Free Payment Intent settlement was not persisted order=%s',
+                intent.order_id,
+            )
+            await render_page(
+                message,
+                page_key='payment_failed',
+                context={'order_id': intent.order_id},
+            )
+            return False
         from bot.services.payment_completion import complete_confirmed_payment
 
         await complete_confirmed_payment(
@@ -138,14 +152,23 @@ async def start_payment_intent_method_selection(
             target=message,
             state=state,
             telegram_id=telegram_id,
-            payment_type='promo_free',
-            referral_amount=0,
         )
         return False
     prepared = load_payment_intent(intent.order_id)
     if prepared is None:
         logger.error("Prepared Payment Intent cannot be loaded: %s", intent.order_id)
         await render_page(message, page_key="payment_order_unavailable")
+        return False
+    if not _has_any_payment_option(prepared, telegram_id=telegram_id):
+        cancel_payment_intent(
+            prepared.order_id,
+            user_id=prepared.user_id,
+        )
+        await render_page(
+            message,
+            page_key='payment_unavailable',
+            force_new=isinstance(target, Message),
+        )
         return False
     await show_payment_method_select(
         target,
@@ -163,11 +186,75 @@ async def start_payment_intent_method_selection(
     return False
 
 
+async def start_tariff_payment_intent(
+    target: CallbackQuery | Message,
+    state: FSMContext | None,
+    *,
+    purpose: str,
+    tariff_id: int,
+    key_id: int = 0,
+    origin_context_token: str | None = None,
+) -> None:
+    """Validate one tariff choice and enter the stock PaymentIntent method flow."""
+    if purpose not in {PURPOSE_KEY_PURCHASE, PURPOSE_KEY_RENEWAL}:
+        await _render_target_page(target, 'action_unavailable')
+        return
+    if origin_context_token is not None and purpose != PURPOSE_KEY_PURCHASE:
+        await _render_target_page(target, 'action_unavailable')
+        return
+
+    telegram_id = int(target.from_user.id)
+    tariff = get_tariff_by_id(tariff_id)
+    user_id = _get_or_create_internal_user_id(target)
+    if not is_tariff_available_for_payment(tariff):
+        await _render_target_page(target, 'action_unavailable')
+        return
+    purpose_data = {'tariff_id': int(tariff_id)}
+    if purpose == PURPOSE_KEY_RENEWAL:
+        key = get_key_details_for_user(int(key_id), telegram_id)
+        if not key:
+            await _render_target_page(target, 'key_not_found')
+            return
+        if not is_tariff_available_for_payment(tariff, key):
+            await _render_target_page(target, 'action_unavailable')
+            return
+        purpose_data['key_id'] = int(key_id)
+
+    try:
+        intent = create_payment_intent(
+            user_id=user_id,
+            purpose=purpose,
+            purpose_data=purpose_data,
+            origin_context_token=origin_context_token,
+        )
+    except ValueError as exc:
+        logger.warning(
+            'Rejected tariff PaymentIntent telegram_id=%s tariff=%s: %s',
+            telegram_id,
+            tariff_id,
+            exc,
+        )
+        await _render_target_page(target, 'action_unavailable')
+        return
+    callback_answered = await start_payment_intent_method_selection(
+        target,
+        state,
+        intent,
+        telegram_id=telegram_id,
+    )
+    if isinstance(target, CallbackQuery) and not callback_answered:
+        await target.answer()
+
+
 @router.callback_query(F.data.startswith('payment_intent_tariff:'))
 async def payment_intent_tariff_handler(callback: CallbackQuery, state: FSMContext):
     """Creates a trusted intent after purchase/renewal tariff selection."""
     try:
-        _, purpose, tariff_raw, key_raw = callback.data.split(':', 3)
+        parts = callback.data.split(':')
+        if len(parts) not in {4, 5}:
+            raise ValueError('invalid tariff callback field count')
+        _, purpose, tariff_raw, key_raw = parts[:4]
+        origin_context_token = parts[4] if len(parts) == 5 else None
         tariff_id = int(tariff_raw)
         key_id = int(key_raw or 0)
     except (TypeError, ValueError):
@@ -176,36 +263,17 @@ async def payment_intent_tariff_handler(callback: CallbackQuery, state: FSMConte
     if purpose not in {PURPOSE_KEY_PURCHASE, PURPOSE_KEY_RENEWAL}:
         await _render_callback_page(callback, "action_unavailable")
         return
-
-    tariff = get_tariff_by_id(tariff_id)
-    user_id = _get_or_create_internal_user_id(callback)
-    if not is_tariff_available_for_payment(tariff):
+    if origin_context_token is not None and purpose != PURPOSE_KEY_PURCHASE:
         await _render_callback_page(callback, "action_unavailable")
         return
-    purpose_data = {'tariff_id': tariff_id}
-    if purpose == PURPOSE_KEY_RENEWAL:
-        key = get_key_details_for_user(key_id, callback.from_user.id)
-        if not key:
-            await _render_callback_page(callback, "key_not_found")
-            return
-        if not is_tariff_available_for_payment(tariff, key):
-            await _render_callback_page(callback, "action_unavailable")
-            return
-        purpose_data['key_id'] = key_id
-
-    intent = create_payment_intent(
-        user_id=user_id,
-        purpose=purpose,
-        purpose_data=purpose_data,
-    )
-    callback_answered = await start_payment_intent_method_selection(
+    await start_tariff_payment_intent(
         callback,
         state,
-        intent,
-        telegram_id=callback.from_user.id,
+        purpose=purpose,
+        tariff_id=tariff_id,
+        key_id=key_id,
+        origin_context_token=origin_context_token,
     )
-    if not callback_answered:
-        await callback.answer()
 
 
 @router.callback_query(F.data.startswith('payment_intent_methods:'))
@@ -227,8 +295,6 @@ async def payment_intent_methods_handler(
             callback,
             state,
             intent.order_id,
-            payment_type=intent.payment_type or 'cryptobot',
-            referral_amount=0,
         )
         return
     if result.outcome == 'uncertain':
@@ -267,8 +333,6 @@ async def payment_intent_cancel_handler(callback: CallbackQuery, state: FSMConte
             callback,
             state,
             intent.order_id,
-            payment_type=intent.payment_type or 'cryptobot',
-            referral_amount=0,
         )
         return
     if result.outcome == 'uncertain':
@@ -301,6 +365,7 @@ async def payment_intent_cancel_handler(callback: CallbackQuery, state: FSMConte
             'key.purchase.start',
             source='callback',
             state=state,
+            origin_context=intent.origin_context,
         )
         return
     if intent.purpose == PURPOSE_KEY_RENEWAL and target.kind == 'page' and target.value == 'renew_payment':
@@ -405,13 +470,24 @@ async def payment_intent_provider_handler(
         )
         return
     if quote.is_free:
-        update_payment_type(intent.order_id, 'promo_free')
+        if not confirm_internal_payment_settlement(
+            intent.order_id,
+            payment_type='promo_free',
+        ):
+            logger.error(
+                'Free Payment Intent settlement was not persisted order=%s',
+                intent.order_id,
+            )
+            await _render_callback_page(
+                callback,
+                'payment_failed',
+                order_id=intent.order_id,
+            )
+            return
         await _complete_intent(
             callback,
             state,
             intent.order_id,
-            payment_type='promo_free',
-            referral_amount=0,
         )
         return
 
@@ -441,8 +517,6 @@ async def payment_intent_provider_handler(
             callback,
             state,
             intent.order_id,
-            payment_type=adapter.payment_type,
-            referral_amount=0,
         )
         return
     if invoice.presentation == 'telegram_invoice':
@@ -469,8 +543,6 @@ async def payment_intent_check_handler(callback: CallbackQuery, state: FSMContex
             callback,
             state,
             intent.order_id,
-            payment_type=intent.payment_type or '',
-            referral_amount=0,
         )
         return
     if status == 'canceled':
@@ -522,27 +594,31 @@ async def apply_payment_intent_balance(callback: CallbackQuery, state: FSMContex
             payment_amount_text=format_base_minor(quote.payable_amount_minor, intent.base_currency),
         )
         return
-    save_payment_balance_deduction(intent.order_id, deduction)
     remaining = max(0, quote.payable_amount_minor - deduction)
     if remaining == 0:
-        update_payment_intent_quote(
+        if not confirm_internal_payment_settlement(
             intent.order_id,
             payment_type='balance',
-            payable_amount_minor=0,
-            charge_amount='0',
-            charge_currency=intent.base_currency,
+            balance_deduct_minor=deduction,
             rate_snapshot=dict(quote.rate_snapshot),
-            compatibility_amount_cents=0,
-            compatibility_amount_stars=0,
-        )
+        ):
+            logger.error(
+                'Balance Payment Intent settlement was not persisted order=%s',
+                intent.order_id,
+            )
+            await _render_callback_page(
+                callback,
+                'payment_failed',
+                order_id=intent.order_id,
+            )
+            return
         await _complete_intent(
             callback,
             state,
             intent.order_id,
-            payment_type='balance',
-            referral_amount=0,
         )
         return
+    save_payment_balance_deduction(intent.order_id, deduction)
     quote_payment_intent(intent.order_id, 'balance')
     updated = load_payment_intent(intent.order_id)
     if not updated:
@@ -644,9 +720,6 @@ async def _complete_intent(
     callback: CallbackQuery,
     state: FSMContext,
     order_id: str,
-    *,
-    payment_type: str,
-    referral_amount: int,
 ) -> None:
     from bot.services.payment_completion import complete_confirmed_payment
 
@@ -656,8 +729,6 @@ async def _complete_intent(
         target=callback.message,
         state=state,
         telegram_id=callback.from_user.id,
-        payment_type=payment_type,
-        referral_amount=referral_amount,
     )
     try:
         await callback.answer()
@@ -687,14 +758,33 @@ async def _show_unavailable(callback: CallbackQuery) -> None:
     await _render_callback_page(callback, "payment_unavailable")
 
 
-def _get_or_create_internal_user_id(callback: CallbackQuery) -> int:
+def _get_or_create_internal_user_id(target: CallbackQuery | Message) -> int:
     user, _ = get_or_create_user(
-        callback.from_user.id,
-        callback.from_user.username,
-        callback.from_user.first_name,
-        callback.from_user.last_name,
+        target.from_user.id,
+        target.from_user.username,
+        target.from_user.first_name,
+        target.from_user.last_name,
     )
     return int(user["id"])
+
+
+async def _render_target_page(
+    target: CallbackQuery | Message,
+    page_key: str,
+    **context_values,
+) -> None:
+    await render_page(
+        target,
+        page_key=page_key,
+        context=build_page_flow_context(
+            target,
+            telegram_id=target.from_user.id,
+            **context_values,
+        ),
+        force_new=isinstance(target, Message),
+    )
+    if isinstance(target, CallbackQuery):
+        await target.answer()
 
 
 async def _render_callback_page(
@@ -702,16 +792,7 @@ async def _render_callback_page(
     page_key: str,
     **context_values,
 ) -> None:
-    await render_page(
-        callback,
-        page_key=page_key,
-        context=build_page_flow_context(
-            callback,
-            telegram_id=callback.from_user.id,
-            **context_values,
-        ),
-    )
-    await callback.answer()
+    await _render_target_page(callback, page_key, **context_values)
 
 
 def _intent_method_page_key(intent) -> str:
@@ -769,6 +850,17 @@ def _quote_discount_line(quote) -> str:
 
 def _balance_spending_enabled() -> bool:
     return is_referral_enabled() and get_referral_reward_type() == 'balance'
+
+
+def _has_any_payment_option(intent, *, telegram_id: int) -> bool:
+    """Return true for a normal provider/balance route after free completion was tried."""
+    if list_payment_provider_adapters(intent, telegram_id=telegram_id):
+        return True
+    return (
+        intent.purpose != 'balance_topup'
+        and get_user_balance(intent.user_id) > 0
+        and _balance_spending_enabled()
+    )
 
 
 def _provider_minimum(adapter) -> int:

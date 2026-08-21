@@ -53,12 +53,8 @@ async def grant_days_to_first_active_key(
                 return result
 
             key_id = int(result['key_id'])
-            from bot.services.vpn_api import (
-                restore_traffic_limit_in_db,
-                sync_key_to_panel_state,
-            )
+            from bot.services.vpn_api import sync_key_to_panel_state
 
-            traffic_restored = restore_traffic_limit_in_db(key_id)
             try:
                 sync_stats = await sync_key_to_panel_state(key_id, reset_traffic=False)
             except Exception as error:
@@ -66,7 +62,7 @@ async def grant_days_to_first_active_key(
                 sync_stats = {'ok': 0, 'errors': 1}
             result['renew_result'] = {
                 'db_updated': True,
-                'traffic_restored': bool(traffic_restored),
+                'traffic_restored': False,
                 'panel_synced': bool(sync_stats.get('ok')) and not sync_stats.get('errors'),
                 'sync_stats': sync_stats,
             }
@@ -119,7 +115,6 @@ async def grant_days_to_first_active_key(
         renew_result = await renew_key_access(
             key_id,
             days,
-            reset_traffic=False,
             tariff_id=None,
         )
         if not renew_result.get('db_updated'):

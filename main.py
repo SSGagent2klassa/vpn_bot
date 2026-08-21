@@ -213,6 +213,7 @@ async def main():
     # Creating a bot with a custom session and a dispatcher
     session = SafeParseSession()
     bot = Bot(token=BOT_TOKEN, session=session)
+    from bot.utils.custom_extensions import _set_extension_runtime_bot
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
 
@@ -254,9 +255,11 @@ async def main():
     
 
     
+    _set_extension_runtime_bot(bot)
     try:
         await dp.start_polling(bot)
     finally:
+        _set_extension_runtime_bot(None)
         background_tasks = getattr(bot, 'background_tasks', [])
         for task in background_tasks:
             task.cancel()

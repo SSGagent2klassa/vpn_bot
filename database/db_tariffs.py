@@ -46,15 +46,9 @@ def _base_currency_and_rub_rate(conn) -> tuple[str, Decimal]:
 
 
 def normalize_tariff_money(row: Dict[str, Any], *, base_currency: str, rub_rate: Decimal) -> Dict[str, Any]:
-    """Adds generic money fields and a derived legacy RUB compatibility value."""
+    """Add canonical money data and the published derived RUB alias."""
     data = dict(row)
     minor = int(data.get('price_minor') or 0)
-    if minor == 0 and base_currency == 'RUB' and data.get('price_rub'):
-        minor = int(
-            (Decimal(str(data.get('price_rub'))) * Decimal('100')).to_integral_value(
-                rounding=ROUND_HALF_UP
-            )
-        )
     data['price_minor'] = minor
     data['base_currency'] = base_currency
     rub_major = Decimal(minor) / Decimal('100')
@@ -85,7 +79,7 @@ def get_all_tariffs(
             conditions.append("system_type IS NULL")
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         cursor = conn.execute(f"""
-            SELECT id, name, duration_days, price_rub, price_minor,
+            SELECT id, name, duration_days, price_minor,
                    display_order, is_active, traffic_limit_gb, group_id, max_ips,
                    system_type
             FROM tariffs
@@ -107,7 +101,7 @@ def get_tariff_by_id(tariff_id: int) -> Optional[Dict[str, Any]]:
     """
     with get_db() as conn:
         cursor = conn.execute("""
-            SELECT id, name, duration_days, price_rub, price_minor,
+            SELECT id, name, duration_days, price_minor,
                    display_order, is_active, traffic_limit_gb, group_id, max_ips,
                    system_type
             FROM tariffs
@@ -164,13 +158,11 @@ def add_tariff(
             )
         else:
             resolved_minor = max(0, int(price_minor))
-        base_major = Decimal(resolved_minor) / Decimal('100')
-        legacy_rub = base_major if base == 'RUB' else base_major * rub_rate
         cursor = conn.execute("""
-            INSERT INTO tariffs (name, duration_days, price_rub, price_minor,
+            INSERT INTO tariffs (name, duration_days, price_minor,
                                 display_order, is_active, traffic_limit_gb, group_id, max_ips)
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
-        """, (name, duration_days, float(legacy_rub), resolved_minor, display_order, traffic_limit_gb, group_id, max_ips))
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+        """, (name, duration_days, resolved_minor, display_order, traffic_limit_gb, group_id, max_ips))
         tariff_id = cursor.lastrowid
         logger.info(f"Добавлен тариф: {name} (ID: {tariff_id}, трафик: {traffic_limit_gb} ГБ, группа: {group_id}, max_ips: {max_ips})")
         return tariff_id
@@ -216,15 +208,15 @@ def update_tariff(tariff_id: int, **fields) -> bool:
             return False
         base, rub_rate = _base_currency_and_rub_rate(conn)
         if 'price_minor' in fields:
-            resolved_minor = max(0, int(fields['price_minor']))
-            base_major = Decimal(resolved_minor) / Decimal('100')
-            fields['price_rub'] = float(base_major if base == 'RUB' else base_major * rub_rate)
+            fields['price_minor'] = max(0, int(fields['price_minor']))
+            fields.pop('price_rub', None)
         elif 'price_rub' in fields:
             rub_major = Decimal(str(fields['price_rub'] or 0))
             base_major = rub_major if base == 'RUB' else rub_major / rub_rate
             fields['price_minor'] = int(
                 (base_major * Decimal('100')).to_integral_value(rounding=ROUND_HALF_UP)
             )
+            fields.pop('price_rub', None)
         set_clause = ", ".join(f"{k} = ?" for k in fields.keys())
         values = list(fields.values()) + [tariff_id]
         cursor = conn.execute(f"""
@@ -298,7 +290,7 @@ def _get_admin_custom_tariff_with_conn(
 ) -> Optional[Dict[str, Any]]:
     row = conn.execute(
         """
-        SELECT id, name, duration_days, price_rub, price_minor,
+        SELECT id, name, duration_days, price_minor,
                display_order, is_active, traffic_limit_gb, group_id, max_ips,
                system_type
         FROM tariffs
@@ -346,10 +338,10 @@ def ensure_admin_custom_tariff(
     cursor = conn.execute(
         """
         INSERT INTO tariffs (
-            name, duration_days, price_rub, price_minor, display_order,
+            name, duration_days, price_minor, display_order,
             is_active, traffic_limit_gb, group_id, max_ips, system_type
         )
-        VALUES (?, 0, 0, 0, 999, 0, 0, ?, 1, ?)
+        VALUES (?, 0, 0, 999, 0, 0, ?, 1, ?)
         """,
         (f'Admin Custom {int(group_id)}', int(group_id), ADMIN_CUSTOM_SYSTEM_TYPE),
     )

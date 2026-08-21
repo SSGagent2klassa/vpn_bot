@@ -383,6 +383,20 @@ async def _provision_resolved_new_key(
             )
         raise RuntimeError("Failed to persist subscription key configuration")
 
+    try:
+        from bot.services.subscription_composition import (
+            schedule_key_subscription_reconciles,
+        )
+
+        schedule_key_subscription_reconciles(key_id=int(setup.key_id))
+    except Exception as error:
+        logger.warning(
+            "Could not immediately schedule subscription composition after "
+            "key configuration key=%s type=%s",
+            setup.key_id,
+            type(error).__name__,
+        )
+
     if provisioned.complete:
         sync_stats = {
             "created": ready_count,
@@ -444,6 +458,14 @@ async def _provision_resolved_new_key(
             "created_in_this_flow": False,
             **event_context,
         },
+    )
+    from bot.services.extension_completion import (
+        run_extension_completion_after_key_configured,
+    )
+
+    await run_extension_completion_after_key_configured(
+        setup.order_id,
+        key_id=setup.key_id,
     )
 
     ready_key = get_key_details_for_user(setup.key_id, setup.telegram_id)

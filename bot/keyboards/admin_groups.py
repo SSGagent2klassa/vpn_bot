@@ -37,10 +37,38 @@ def group_view_kb(
         text=f'{reset_icon} Автосброс трафика 1-го числа',
         callback_data=f'admin_group_monthly_reset:{group_id}',
     ))
+    builder.row(InlineKeyboardButton(
+        text='🔗 Привязка к подписке',
+        callback_data=f'admin_group_parent:{group_id}',
+    ))
     builder.row(InlineKeyboardButton(text='✏️ Переименовать', callback_data=f'admin_group_edit:{group_id}'))
     if group_id != 1:
         builder.row(InlineKeyboardButton(text='🗑️ Удалить группу', callback_data=f'admin_group_delete:{group_id}'))
     builder.row(back_button('admin_groups'), home_button())
+    return builder.as_markup()
+
+
+def group_subscription_parent_kb(
+    groups: List[Dict[str, Any]],
+    *,
+    current_parent_group_id: Optional[int],
+    back_callback: str,
+) -> InlineKeyboardMarkup:
+    """Build the optional subscription parent-group selector."""
+    builder = InlineKeyboardBuilder()
+    standalone_icon = '🟢' if current_parent_group_id is None else '⚪'
+    builder.row(InlineKeyboardButton(
+        text=f'{standalone_icon} Не привязывать',
+        callback_data='admin_group_parent_set:0',
+    ))
+    for group in groups:
+        group_id = int(group['id'])
+        icon = '🟢' if group_id == current_parent_group_id else '⚪'
+        builder.row(InlineKeyboardButton(
+            text=f"{icon} {group['name']}",
+            callback_data=f'admin_group_parent_set:{group_id}',
+        ))
+    builder.row(back_button(back_callback), home_button())
     return builder.as_markup()
 
 def group_delete_confirm_kb(group_id: int) -> InlineKeyboardMarkup:

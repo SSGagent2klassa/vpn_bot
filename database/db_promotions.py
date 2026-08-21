@@ -614,24 +614,15 @@ def save_order_pricing_snapshot(
     *,
     order_id: str,
     payment_type: str,
-    original_amount: int,
-    discount_amount: int,
-    final_amount: int,
-    amount_unit: str,
+    nominal_amount_minor: int,
+    payable_amount_minor: int,
     promo: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    if amount_unit not in ("cents", "stars"):
-        raise ValueError("amount_unit должен быть cents или stars")
-
     promo_id = promo.get("id") if promo else None
     promo_code = promo.get("code") if promo else None
     discount_percent = int(promo.get("discount_percent") or 0) if promo else 0
-    original_cents = original_amount if amount_unit == "cents" else None
-    discount_cents = discount_amount if amount_unit == "cents" else 0
-    final_cents = final_amount if amount_unit == "cents" else None
-    original_stars = original_amount if amount_unit == "stars" else None
-    discount_stars = discount_amount if amount_unit == "stars" else 0
-    final_stars = final_amount if amount_unit == "stars" else None
+    nominal = max(0, int(nominal_amount_minor))
+    payable = max(0, int(payable_amount_minor))
 
     with get_db() as conn:
         cursor = conn.execute(
@@ -641,33 +632,19 @@ def save_order_pricing_snapshot(
                 promo_code_id = ?,
                 promo_code = ?,
                 discount_percent = ?,
-                original_amount_cents = ?,
-                discount_amount_cents = ?,
-                final_amount_cents = ?,
-                original_amount_stars = ?,
-                discount_amount_stars = ?,
-                final_amount_stars = ?,
-                amount_cents = CASE WHEN ? = 'cents' THEN ? ELSE amount_cents END,
-                amount_stars = CASE WHEN ? = 'stars' THEN ? ELSE amount_stars END,
+                nominal_amount_minor = ?,
+                payable_amount_minor = ?,
                 is_promo_free = ?
-            WHERE order_id = ?
+            WHERE order_id = ? AND intent_version = 1
             """,
             (
                 payment_type,
                 promo_id,
                 promo_code,
                 discount_percent,
-                original_cents,
-                discount_cents,
-                final_cents,
-                original_stars,
-                discount_stars,
-                final_stars,
-                amount_unit,
-                final_amount,
-                amount_unit,
-                final_amount,
-                1 if final_amount == 0 and promo else 0,
+                nominal,
+                payable,
+                1 if payable == 0 and promo else 0,
                 order_id,
             ),
         )

@@ -119,7 +119,10 @@ async def cmd_start(message: Message, state: FSMContext, command: CommandObject)
         from bot.services.billing import process_crypto_payment
         from bot.services.payment_completion import complete_confirmed_payment
         try:
-            (success, text, order) = await process_crypto_payment(args, user_id=user['id'], bot=message.bot)
+            (success, text, order) = await process_crypto_payment(
+                args,
+                user_id=user['id'],
+            )
             if success and order:
                 await complete_confirmed_payment(
                     str(order.get('order_id') or ''),
@@ -127,15 +130,9 @@ async def cmd_start(message: Message, state: FSMContext, command: CommandObject)
                     target=message,
                     state=state,
                     telegram_id=message.from_user.id,
-                    payment_type=str(order.get('payment_type') or 'crypto'),
-                    referral_amount=int(
-                        order.get('final_amount_cents')
-                        if order.get('final_amount_cents') is not None
-                        else order.get('amount_cents') or 0
-                    ),
                 )
             else:
-                logger.warning('Legacy crypto deep-link was not completed: %s', text)
+                logger.warning('Crypto payment deep-link was not completed: %s', text)
                 from bot.utils.page_renderer import render_page
 
                 await render_page(message, 'payment_failed', force_new=True)
@@ -146,7 +143,7 @@ async def cmd_start(message: Message, state: FSMContext, command: CommandObject)
 
                 await render_page(message, 'payment_order_unavailable', force_new=True)
             else:
-                logger.exception('Legacy crypto payment processing failed: %s', e)
+                logger.exception('Crypto payment processing failed: %s', e)
                 from bot.utils.page_renderer import render_page
 
                 await render_page(message, 'payment_failed', force_new=True)

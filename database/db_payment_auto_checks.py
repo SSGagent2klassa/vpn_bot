@@ -18,7 +18,7 @@ AUTO_CHECK_STATES = {
 
 
 def create_payment_auto_check_tables(conn: sqlite3.Connection) -> None:
-    """Creates payment auto-check storage for tests and compatibility guards."""
+    """Ensure polling storage exists in isolated service/test databases."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS payment_auto_checks (
@@ -93,25 +93,15 @@ def get_due_payment_auto_checks(limit: int = 10) -> list[dict[str, Any]]:
     normalized_limit = max(1, min(int(limit), 100))
     with get_db() as conn:
         create_payment_auto_check_tables(conn)
-        payment_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(payments)").fetchall()
-        }
-        intent_select = (
-            "p.intent_version, p.purpose,"
-            if {'intent_version', 'purpose'}.issubset(payment_columns)
-            else "0 AS intent_version, NULL AS purpose,"
-        )
         rows = conn.execute(
-            f"""
+            """
             SELECT pac.*, p.payment_type, p.status AS order_status,
-                   {intent_select}
-                   p.user_id, p.vpn_key_id, p.final_amount_cents,
-                   p.amount_cents, p.balance_deduct_cents,
-                   p.yookassa_payment_id, p.wata_link_id,
-                   p.platega_transaction_id, p.cardlink_bill_id
+                   p.intent_version, p.purpose, p.user_id, p.vpn_key_id,
+                   p.payable_amount_minor, p.balance_deduct_minor
             FROM payment_auto_checks pac
             JOIN payments p ON p.order_id = pac.order_id
-            WHERE (
+            WHERE p.intent_version = 1
+              AND (
                     (p.status = 'pending' AND pac.state IN ('active', 'provider_succeeded'))
                  OR (p.status = 'paid' AND pac.state = 'provider_succeeded')
               )

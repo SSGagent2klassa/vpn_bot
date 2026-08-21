@@ -11,17 +11,27 @@ from aiogram.types import CallbackQuery, Message
 from bot.keyboards.admin import promotion_cancel_kb
 from bot.states.admin_states import AdminStates
 from bot.utils.admin import is_admin
-from bot.utils.text import get_message_text_for_storage, safe_edit_or_send
+from bot.utils.admin_dialog import (
+    render_admin_dialog,
+    render_admin_dialog_from_input,
+)
+from bot.utils.text import get_message_text_for_storage
 from database.requests import create_coupon_batch
 
 router = Router()
 
 
-async def _delete_input(message: Message) -> None:
-    try:
-        await message.delete()
-    except Exception:
-        pass
+def _coupon_generator_prompt(
+    title: str,
+    prompt: str,
+    *,
+    error: str | None = None,
+) -> str:
+    parts = [title]
+    if error:
+        parts.append(f"❌ {error}")
+    parts.append(prompt)
+    return "\n\n".join(parts)
 
 
 @router.callback_query(F.data == "admin_coupons_generate")
@@ -33,10 +43,13 @@ async def admin_coupons_generate(
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
     await state.set_state(AdminStates.coupon_generate_discount)
-    await safe_edit_or_send(
+    await render_admin_dialog(
         callback.message,
-        "🎲 <b>Генератор купонов</b>\n\n"
-        "Введите размер скидки от 0 до 100%.",
+        state,
+        _coupon_generator_prompt(
+            "🎲 <b>Генератор купонов</b>",
+            "Введите размер скидки от 0 до 100%.",
+        ),
         reply_markup=promotion_cancel_kb("admin_coupons"),
     )
     await callback.answer()
@@ -54,22 +67,28 @@ async def admin_coupons_generate_discount(
     if not is_admin(message.from_user.id):
         return
     raw = get_message_text_for_storage(message, "plain").strip()
-    await _delete_input(message)
     if not raw.isdigit() or not 0 <= int(raw) <= 100:
-        await safe_edit_or_send(
+        await render_admin_dialog_from_input(
             message,
-            "❌ Введите число от 0 до 100.",
+            state,
+            _coupon_generator_prompt(
+                "🎲 <b>Генератор купонов</b>",
+                "Введите размер скидки от 0 до 100%.",
+                error="Введите целое число от 0 до 100.",
+            ),
             reply_markup=promotion_cancel_kb("admin_coupons"),
-            force_new=True,
         )
         return
     await state.update_data(coupon_generate_discount=int(raw))
     await state.set_state(AdminStates.coupon_generate_lifetime)
-    await safe_edit_or_send(
+    await render_admin_dialog_from_input(
         message,
-        "⏳ <b>Срок жизни</b>\n\nВведите количество дней.",
+        state,
+        _coupon_generator_prompt(
+            "⏳ <b>Срок жизни</b>",
+            "Введите количество дней.",
+        ),
         reply_markup=promotion_cancel_kb("admin_coupons"),
-        force_new=True,
     )
 
 
@@ -85,23 +104,28 @@ async def admin_coupons_generate_lifetime(
     if not is_admin(message.from_user.id):
         return
     raw = get_message_text_for_storage(message, "plain").strip()
-    await _delete_input(message)
     if not raw.isdigit() or int(raw) <= 0:
-        await safe_edit_or_send(
+        await render_admin_dialog_from_input(
             message,
-            "❌ Введите количество дней больше 0.",
+            state,
+            _coupon_generator_prompt(
+                "⏳ <b>Срок жизни</b>",
+                "Введите количество дней.",
+                error="Введите целое число больше 0.",
+            ),
             reply_markup=promotion_cancel_kb("admin_coupons"),
-            force_new=True,
         )
         return
     await state.update_data(coupon_generate_lifetime=int(raw))
     await state.set_state(AdminStates.coupon_generate_count)
-    await safe_edit_or_send(
+    await render_admin_dialog_from_input(
         message,
-        "🔢 <b>Количество</b>\n\n"
-        "Введите количество купонов. За один раз можно создать до 500.",
+        state,
+        _coupon_generator_prompt(
+            "🔢 <b>Количество</b>",
+            "Введите количество купонов. За один раз можно создать до 500.",
+        ),
         reply_markup=promotion_cancel_kb("admin_coupons"),
-        force_new=True,
     )
 
 
@@ -117,16 +141,24 @@ async def admin_coupons_generate_count(
     if not is_admin(message.from_user.id):
         return
     raw = get_message_text_for_storage(message, "plain").strip()
-    await _delete_input(message)
     if not raw.isdigit() or not 1 <= int(raw) <= 500:
-        await safe_edit_or_send(
+        await render_admin_dialog_from_input(
             message,
-            "❌ Введите число от 1 до 500.",
+            state,
+            _coupon_generator_prompt(
+                "🔢 <b>Количество</b>",
+                "Введите количество купонов. За один раз можно создать до 500.",
+                error="Введите целое число от 1 до 500.",
+            ),
             reply_markup=promotion_cancel_kb("admin_coupons"),
-            force_new=True,
         )
         return
     data = await state.get_data()
+    target = await render_admin_dialog_from_input(
+        message,
+        state,
+        "⏳ <b>Генерация купонов</b>\n\nСоздаю коды…",
+    )
     coupons = create_coupon_batch(
         discount_percent=data["coupon_generate_discount"],
         lifetime_days=data["coupon_generate_lifetime"],
@@ -134,7 +166,6 @@ async def admin_coupons_generate_count(
         source="admin_generated",
         created_by_admin_id=message.from_user.id,
     )
-    await state.clear()
     codes = "\n".join(coupon["code"] for coupon in coupons)
     text = (
         "✅ <b>Купоны сгенерированы</b>\n\n"
@@ -143,9 +174,12 @@ async def admin_coupons_generate_count(
         f"Количество: <b>{len(coupons)}</b>\n\n"
         f"<pre>{html.escape(codes)}</pre>"
     )
-    await safe_edit_or_send(
-        message,
-        text,
-        reply_markup=promotion_cancel_kb("admin_coupons"),
-        force_new=True,
-    )
+    try:
+        await render_admin_dialog(
+            target,
+            state,
+            text,
+            reply_markup=promotion_cancel_kb("admin_coupons"),
+        )
+    finally:
+        await state.clear()

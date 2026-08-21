@@ -76,48 +76,6 @@ def _target_with_message(target: Any, message: Message | None, from_user=None):
     )
 
 
-def _owner_from_order(order: dict | None) -> tuple[int | None, str | None]:
-    """Resolve a key owner from the persisted order, never from a bot message."""
-    if not order or not order.get("user_id"):
-        return None, None
-    try:
-        from database.requests import get_user_by_id
-
-        user = get_user_by_id(int(order["user_id"]))
-    except Exception as error:
-        logger.warning(
-            "Failed to resolve owner for order=%s user=%s: %s",
-            order.get("order_id"),
-            order.get("user_id"),
-            error,
-        )
-        return None, None
-    if not user:
-        return None, None
-    return int(user.get("telegram_id") or 0) or None, user.get("username")
-
-
-def _resolve_new_key_owner(
-    target,
-    order: dict | None,
-    *,
-    owner_telegram_id: int | None = None,
-    owner_username: str | None = None,
-    state_data: dict | None = None,
-) -> tuple[int | None, str | None]:
-    """Compatibility helper for existing callers and tests."""
-    state_data = state_data or {}
-    telegram_id = owner_telegram_id or state_data.get("new_key_owner_telegram_id")
-    username = (
-        owner_username
-        if owner_username is not None
-        else state_data.get("new_key_owner_username")
-    )
-    if telegram_id:
-        return int(telegram_id), username
-    return _owner_from_order(order)
-
-
 def _owner_user_stub(telegram_id: int | None, username: str | None):
     if not telegram_id:
         return None
@@ -289,6 +247,15 @@ async def run_new_key_setup_flow(
         )
 
     if result.status is NewKeySetupStatus.READY:
+        from bot.services.extension_completion import (
+            run_extension_completion_after_key_configured,
+        )
+
+        await run_extension_completion_after_key_configured(
+            result.order_id,
+            key_id=result.key_id,
+            bot=getattr(target, 'bot', None),
+        )
         await _clear_state(state)
         delivery_target = target
         if isinstance(target, BackgroundKeyFlowTarget) and target.message is None:
@@ -330,6 +297,22 @@ async def run_new_key_setup_flow(
                     error_code="key_delivery_failed",
                     error=str(error),
                 )
+            try:
+                from bot.handlers.user.subscription_hosts import (
+                    offer_default_subscription_host,
+                )
+
+                await offer_default_subscription_host(
+                    delivery_target,
+                    component_key_id=int(result.key_id or 0),
+                    telegram_id=result.telegram_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Post-delivery subscription host flow failed order=%s key=%s",
+                    result.order_id,
+                    result.key_id,
+                )
         return result
 
     await _render_key_flow_page(
@@ -339,26 +322,6 @@ async def run_new_key_setup_flow(
         force_new=force_new,
     )
     return result
-
-
-async def start_new_key_config(
-    message: Message,
-    state: FSMContext | None,
-    order_id: str,
-    key_id: int | None = None,
-    owner_telegram_id: int | None = None,
-    owner_username: str | None = None,
-) -> NewKeySetupResult:
-    """Compatibility entry that now delegates to the shared state machine."""
-    del key_id
-    return await run_new_key_setup_flow(
-        message,
-        order_id,
-        state=state,
-        owner_telegram_id=owner_telegram_id,
-        owner_username=owner_username,
-        force_new=True,
-    )
 
 
 async def start_new_key_config_background(
@@ -428,6 +391,5 @@ __all__ = [
     "BackgroundKeyFlowTarget",
     "process_new_key_server_selection",
     "run_new_key_setup_flow",
-    "start_new_key_config",
     "start_new_key_config_background",
 ]
