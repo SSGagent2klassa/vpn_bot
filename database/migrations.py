@@ -3088,24 +3088,23 @@ def _rebuild_tariffs_for_v102(conn: sqlite3.Connection) -> None:
 
 def migration_102(conn: sqlite3.Connection) -> None:
     """Migration v102: retire Payment Intent v0 runtime and physical aliases."""
-    pending_v0 = int(conn.execute(
-        """
-        SELECT COUNT(*) FROM payments
-        WHERE intent_version <> 1 AND status = 'pending'
-        """
-    ).fetchone()[0])
-    if pending_v0:
-        raise RuntimeError(
-            "Payment Intent v0 cleanup requires manual reconciliation of "
-            f"{pending_v0} pending historical order(s)"
-        )
-
     conn.commit()
     conn.execute("PRAGMA foreign_keys = OFF")
+    canceled_pending_orders = 0
     inserted_audit_rows = 0
     removed_button_sets = 0
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # Supported source releases no longer create v0 orders. Terminalize
+        # their obsolete pending history without blocking ordinary startup.
+        canceled_cursor = conn.execute(
+            """
+            UPDATE payments
+            SET status = 'canceled'
+            WHERE intent_version <> 1 AND status = 'pending'
+            """
+        )
+        canceled_pending_orders = max(0, int(canceled_cursor.rowcount or 0))
         inserted_audit_rows = _preserve_v0_provider_audit_v102(conn)
         conn.execute(
             """
@@ -3164,8 +3163,10 @@ def migration_102(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys = ON")
 
     logger.info(
-        "Migration v102 applied: provider_audit_rows=%s, "
+        "Migration v102 applied: canceled_pending_v0=%s, "
+        "provider_audit_rows=%s, "
         "removed_button_sets=%s",
+        canceled_pending_orders,
         inserted_audit_rows,
         removed_button_sets,
     )
