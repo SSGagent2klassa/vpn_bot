@@ -245,7 +245,14 @@ EOF
         --service-name yadreno-vpn > /dev/null 2>&1; then
         # A requested intermediate/older commit may not expose install-service
         # yet. Keep the current installer able to provision the stable unit.
-        if ! cat > "/etc/systemd/system/$UPDATER_SERVICE_FILE" << EOF
+        local updater_unit_stage_dir
+        if ! updater_unit_stage_dir=$(mktemp -d "/etc/systemd/system/.yadreno-updater-unit.XXXXXX"); then
+            print_err "Не удалось подготовить проверку updater-service"
+            return 1
+        fi
+        local updater_unit_candidate="$updater_unit_stage_dir/$UPDATER_SERVICE_FILE"
+        local updater_unit_error=""
+        if ! cat > "$updater_unit_candidate" << EOF
 [Unit]
 Description=Yadreno VPN managed updater for snapshot %i
 Wants=network-online.target
@@ -254,14 +261,24 @@ After=network-online.target
 [Service]
 Type=oneshot
 User=root
-WorkingDirectory=$INSTALL_DIR
 ExecStart=$VENV_DIR/bin/python $INSTALL_DIR/backup/pre_update/%i/service_runner.py service-request --project-root $INSTALL_DIR --snapshot-id %i --service-name yadreno-vpn
 TimeoutStartSec=20min
 UMask=0077
 Environment=PYTHONUNBUFFERED=1
 EOF
         then
-            print_err "Не удалось записать постоянный updater-service"
+            updater_unit_error="Не удалось записать постоянный updater-service"
+        elif ! chmod 0644 "$updater_unit_candidate"; then
+            updater_unit_error="Не удалось установить права updater-service"
+        elif ! systemd-analyze verify "$updater_unit_candidate"; then
+            updater_unit_error="Updater-service содержит недопустимые настройки"
+        elif ! mv -f "$updater_unit_candidate" "/etc/systemd/system/$UPDATER_SERVICE_FILE"; then
+            updater_unit_error="Не удалось установить updater-service"
+        fi
+        rm -f "$updater_unit_candidate"
+        rmdir "$updater_unit_stage_dir" 2>/dev/null || true
+        if [ -n "$updater_unit_error" ]; then
+            print_err "$updater_unit_error"
             return 1
         fi
         if ! systemctl daemon-reload; then

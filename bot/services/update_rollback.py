@@ -673,7 +673,6 @@ def install_registered_updater_service(
         "[Service]\n"
         "Type=oneshot\n"
         "User=root\n"
-        f"WorkingDirectory={_systemd_quote(str(root))}\n"
         f"ExecStart={_systemd_quote(str(python_path))} {quoted_runner} "
         f"service-request --project-root {_systemd_quote(str(root))} "
         f"--snapshot-id %i --service-name {_systemd_quote(service_name)}\n"
@@ -690,22 +689,44 @@ def install_registered_updater_service(
     except OSError as exc:
         raise UpdateRollbackError(f"Cannot read updater systemd unit: {exc}") from exc
 
-    if current_content != content:
-        temporary_path = _new_sibling_temp_path(unit_path)
-        try:
-            with temporary_path.open("w", encoding="utf-8", newline="\n") as target:
+    verification_path = unit_path
+    temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        if current_content != content:
+            temporary_directory = tempfile.TemporaryDirectory(
+                prefix=".yadreno-updater-unit.",
+                dir=unit_directory,
+            )
+            verification_path = Path(temporary_directory.name) / unit_path.name
+            with verification_path.open(
+                "w",
+                encoding="utf-8",
+                newline="\n",
+            ) as target:
                 target.write(content)
                 target.flush()
                 os.fsync(target.fileno())
-            temporary_path.chmod(0o644)
-            os.replace(temporary_path, unit_path)
-            _fsync_directory(unit_directory)
-        except OSError as exc:
+            verification_path.chmod(0o644)
+
+        verification = _run_command(
+            ["systemd-analyze", "verify", str(verification_path)],
+            cwd=root,
+            timeout=30,
+        )
+        if verification.returncode != 0:
+            output = (verification.stdout + verification.stderr).strip()
             raise UpdateRollbackError(
-                f"Cannot install updater systemd unit: {exc}"
-            ) from exc
-        finally:
-            temporary_path.unlink(missing_ok=True)
+                output or "systemd-analyze rejected updater service"
+            )
+
+        if current_content != content:
+            os.replace(verification_path, unit_path)
+            _fsync_directory(unit_directory)
+    except OSError as exc:
+        raise UpdateRollbackError(f"Cannot install updater systemd unit: {exc}") from exc
+    finally:
+        if temporary_directory is not None:
+            temporary_directory.cleanup()
 
     result = _run_command(
         ["systemctl", "daemon-reload"],
