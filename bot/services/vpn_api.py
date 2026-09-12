@@ -55,6 +55,7 @@ async def provision_client_on_server(
     expire_days: int = 0,
     expiry_time_ms: Optional[int] = None,
     limit_ip: int = 1,
+    limit_hwid: int = 0,
     enable: bool = True,
     tg_id: str = "",
     sub_id: Optional[str] = None,
@@ -72,6 +73,7 @@ async def provision_client_on_server(
         expire_days=expire_days,
         expiry_time_ms=expiry_time_ms,
         limit_ip=limit_ip,
+        limit_hwid=limit_hwid,
         enable=enable,
         tg_id=tg_id,
         sub_id=sub_id,
@@ -712,6 +714,13 @@ async def get_subscription_url_for_key(
         if not suppress_errors:
             raise
         return None
+
+async def reset_key_hwids_on_server(server_id: int, email: str) -> bool:
+    """Сбрасывает зарегистрированные HWID устройства для клиента."""
+    client = await get_client(server_id)
+    if hasattr(client, "reset_client_hwids"):
+        return await client.reset_client_hwids(email)
+    return False
 
 
 __all__ = [

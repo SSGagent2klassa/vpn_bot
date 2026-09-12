@@ -1,6 +1,7 @@
 """Shared domain service for configuring a newly created VPN key."""
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field, replace
@@ -335,10 +336,21 @@ async def _provision_resolved_new_key(
         if "expires_at" in key
         else None
     )
-    max_ips = max(
+    max_devices = max(
         0,
         int(key.get("tariff_max_ips") or tariff.get("max_ips") or 1),
     )
+    # Извлекаем целевой инбаунд из тарифа (fallback на 1 для старых тарифов)
+    raw_inbounds = tariff.get("inbound_ids")
+    if isinstance(raw_inbounds, str):
+        try:
+            target_inbound_ids = json.loads(raw_inbounds)
+        except Exception:
+            target_inbound_ids = [int(x.strip()) for x in raw_inbounds.split(",") if x.strip().isdigit()]
+    elif isinstance(raw_inbounds, list):
+        target_inbound_ids = [int(x) for x in raw_inbounds]
+    else:
+        target_inbound_ids = []
     requested_sub_id = uuid.uuid5(
         uuid.NAMESPACE_URL,
         f"yadrenovpn-subscription:{stable_identity}",
@@ -350,10 +362,12 @@ async def _provision_resolved_new_key(
         total_gb_bytes=persisted_limit_bytes,
         expire_days=days,
         expiry_time_ms=exact_expiry_time_ms,
-        limit_ip=max_ips,
+        limit_ip=0,
+        limit_hwid=max_devices,
         enable=True,
         tg_id=str(setup.telegram_id),
         sub_id=requested_sub_id,
+        inbound_ids=target_inbound_ids
     )
     ready_count = len(provisioned.attached_inbound_ids)
     effective_sub_id = str(provisioned.sub_id or "").strip()

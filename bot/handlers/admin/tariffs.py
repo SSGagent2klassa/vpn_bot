@@ -229,6 +229,7 @@ ADD_TARIFF_STATES = [
     AdminStates.add_tariff_price,
     AdminStates.add_tariff_duration,
     AdminStates.add_tariff_traffic_limit,
+    AdminStates.add_tariff_inbound_ids,
     AdminStates.add_tariff_max_ips,
 ]
 
@@ -251,6 +252,7 @@ def get_add_step_state(step: int) -> AdminStates:
         'price_minor': AdminStates.add_tariff_price,
         'duration_days': AdminStates.add_tariff_duration,
         'traffic_limit_gb': AdminStates.add_tariff_traffic_limit,
+        'inbound_ids': AdminStates.add_tariff_inbound_ids,
         'max_ips': AdminStates.add_tariff_max_ips,
         'display_order': AdminStates.add_tariff_confirm,  # display_order is skipped when adding
     }
@@ -463,6 +465,11 @@ async def process_add_tariff_step(message: Message, state: FSMContext):
         ips_text = f"{max_ips} устр."
         lines.append(f"💻 Лимит устройств: <code>{ips_text}</code>")
         
+        # Отображение Inbound IDs
+        inbounds = tariff_data.get('inbound_ids', [])
+        inbounds_text = ", ".join(f"#{i}" for i in inbounds) if inbounds else "Все доступные"
+        lines.append(f"🔌 Входящие: <code>{inbounds_text}</code>")
+        
         lines.append("\nСохранить тариф?")
         
         await render_admin_dialog_from_input(message, state,
@@ -487,7 +494,9 @@ async def add_tariff_duration_handler(message: Message, state: FSMContext):
     await process_add_tariff_step(message, state)
 
 
-
+@router.message(AdminStates.add_tariff_inbound_ids)
+async def add_tariff_inbound_ids_handler(message: Message, state: FSMContext):
+    await process_add_tariff_step(message, state)
 
 
 @router.message(AdminStates.add_tariff_traffic_limit)
@@ -518,6 +527,7 @@ async def add_tariff_save(callback: CallbackQuery, state: FSMContext):
             price_minor=tariff_data['price_minor'],
             display_order=0,
             traffic_limit_gb=tariff_data.get('traffic_limit_gb', 0),
+            inbound_ids=tariff_data.get('inbound_ids', []),
             group_id=selected_group_id,
             max_ips=tariff_data.get('max_ips', 1)
         )

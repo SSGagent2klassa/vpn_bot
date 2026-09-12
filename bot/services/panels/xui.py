@@ -958,6 +958,7 @@ class XUIClient(BaseVPNClient):
                     enable=self._api_bool(row.get("enable"), True),
                     sub_id=str(row.get("subId") or ""),
                     limit_ip=self._int(row.get("limitIp"), 1),
+                    limit_hwid=self._int(row.get("limitHwid"), 0),
                     reset=self._int(row.get("reset")),
                     details_complete=False,
                 )
@@ -1111,6 +1112,7 @@ class XUIClient(BaseVPNClient):
         expiry_time_ms: Optional[int] = None,
         enable: Optional[bool] = None,
         limit_ip: Optional[int] = None,
+        limit_hwid: Optional[int] = None,
         sub_id: Optional[str] = None,
         flow: Optional[str] = None,
         reset: Optional[int] = None,
@@ -1138,6 +1140,8 @@ class XUIClient(BaseVPNClient):
             payload["enable"] = bool(enable)
         if limit_ip is not None:
             payload["limitIp"] = max(0, int(limit_ip))
+        if limit_hwid is not None:         
+            payload["limitHwid"] = max(0, int(limit_hwid))
         if sub_id is not None:
             payload["subId"] = str(sub_id)
         if flow is not None:
@@ -1201,7 +1205,8 @@ class XUIClient(BaseVPNClient):
         total_gb_bytes: Optional[int] = None,
         expire_days: int = 0,
         expiry_time_ms: Optional[int] = None,
-        limit_ip: int = 1,
+        limit_ip: int = 0,
+        limit_hwid: int = 0,
         enable: bool = True,
         tg_id: str = "",
         sub_id: Optional[str] = None,
@@ -1266,6 +1271,7 @@ class XUIClient(BaseVPNClient):
                     "expiryTime": expiry,
                     "enable": bool(enable),
                     "limitIp": max(0, int(limit_ip)),
+                    "limitHwid": max(0, int(limit_hwid)),
                     "tgId": self._normalize_tg_id(tg_id),
                     "subId": canonical_sub_id,
                     "reset": 0,
@@ -1319,6 +1325,7 @@ class XUIClient(BaseVPNClient):
                         expiry_time_ms=expiry,
                         enable=enable,
                         limit_ip=limit_ip,
+                        limit_hwid=limit_hwid,
                         sub_id=canonical_sub_id,
                         flow=common_flow,
                         reset=0,
@@ -1354,6 +1361,7 @@ class XUIClient(BaseVPNClient):
                     enable=self._api_bool(client.get("enable"), True),
                     sub_id=confirmed_sub_id,
                     limit_ip=self._int(client.get("limitIp"), 1),
+                    limit_hwid=self._int(client.get("limitHwid"), 0),
                     reset=self._int(client.get("reset")),
                     details_complete=True,
                 )
@@ -1797,6 +1805,15 @@ class XUIClient(BaseVPNClient):
         self.session = None
         self.is_authenticated = False
         self._validated_token = None
+    
+    async def reset_client_hwids(self, email: str) -> bool:
+        """Сбрасывает все привязанные HWID устройства клиента."""
+        try:
+            await self._request("DELETE", f"/panel/api/clients/hwids/{email}")
+            return True
+        except Exception as exc:
+            logger.warning("Не удалось сбросить HWID для %s: %s", email, exc)
+            return False
 
 
 __all__ = [

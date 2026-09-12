@@ -174,6 +174,14 @@ async def show_key_details(
         status=status,
         traffic=traffic_info,
     )
+    reset_hwid_button = [
+    [
+        InlineKeyboardButton(
+            text="🔄 Сбросить устройства",
+            callback_data=f"user_key_reset_hwid:{key_id}",
+        )
+    ]
+]
     await render_page(
         message,
         page_key='key_details',
@@ -189,6 +197,7 @@ async def show_key_details(
             **key_page_context,
         },
         force_new=not is_callback,
+        append_buttons=reset_hwid_button,
     )
 
 @router.callback_query(F.data.startswith('key_delete:'))
@@ -904,6 +913,58 @@ async def _render_key_action_page(
     if isinstance(target, CallbackQuery):
         await target.answer()
     return rendered
+
+import time
+from database.requests import get_key_details_for_user
+from bot.services.vpn_api import get_client
+
+# Ограничение: не чаще 1 раза в 60 секунд на ключ
+_HWID_RESET_COOLDOWNS: dict[int, float] = {}
+
+@router.callback_query(F.data.startswith("user_key_reset_hwid:"))
+async def handle_user_key_reset_hwid(callback: CallbackQuery):
+    """Сбрасывает зарегистрированные HWID-устройства для клиента на 3X-UI."""
+    key_id = int(callback.data.split(":")[1])
+    telegram_id = callback.from_user.id
+
+    key = get_key_details_for_user(key_id, telegram_id)
+    if not key:
+        await callback.answer("❌ Ключ не найден.", show_alert=True)
+        return
+
+    server_id = key.get("server_id")
+    email = key.get("panel_email")
+    if not server_id or not email:
+        await callback.answer("⚠️ Ключ еще не привязан к серверу.", show_alert=True)
+        return
+
+    # Защита от спама кликами
+    last_reset = _HWID_RESET_COOLDOWNS.get(key_id, 0)
+    now = time.time()
+    if now - last_reset < 60:
+        remaining = int(60 - (now - last_reset))
+        await callback.answer(
+            f"⏳ Сброс уже выполнялся. Подождите {remaining} сек.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        client = await get_client(int(server_id))
+        # Вызываем endpoint DELETE /panel/api/clients/hwids/{email}
+        await client._request("DELETE", f"/panel/api/clients/hwids/{email}")
+        _HWID_RESET_COOLDOWNS[key_id] = now
+        await callback.answer(
+            "✅ Привязка устройств успешно сброшена!\n\n"
+            "Теперь вы можете подключить новое устройство по вашей ссылке подписки.",
+            show_alert=True,
+        )
+    except Exception as exc:
+        logger.exception("Ошибка при сбросе HWID key_id=%s email=%s: %s", key_id, email, exc)
+        await callback.answer(
+            "❌ Не удалось сбросить устройства. Попробуйте позже или обратитесь в поддержку.",
+            show_alert=True,
+        )
 
 
 register_core_action_executor('key.renew.start', _execute_key_renew_start, replace=True)

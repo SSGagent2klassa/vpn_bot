@@ -88,7 +88,8 @@ class AdminStates(StatesGroup):
     tariff_view = State()            # View a specific tariff
     
     # ========== Adding a tariff (step-by-step dialogue) ==========
-    add_tariff_name = State()        # Step 1: Title
+    add_tariff_name = State()      # Step 1: Name
+    add_tariff_inbound_ids = State()   # Step 2: Inbound traffic
     add_tariff_price = State()       # Step 2: Price in the current base currency
     add_tariff_duration = State()    # Step 3: Duration
     add_tariff_traffic_limit = State() # Step 4: Data Limit (GB)
@@ -283,6 +284,16 @@ TARIFF_PARAMS = [
         "validate": lambda x: x.isdigit() and 0 <= int(x) <= 99,
         "error": "Порядок от 0 до 99",
         "convert": int
+    },
+    {
+        "key": "inbound_ids",
+        "label": "ID входящих подключений (Inbound IDs)",
+        "hint": "номера через запятую, например: 1 или 1, 2 (0 = все инбаунды ноды)",
+        "validate": lambda x: all(part.strip().isdigit() for part in x.split(',') if part.strip()),
+        "error": "Введите числовые ID через запятую (например: 1 или 1, 2)",
+        "convert": lambda x: [int(p.strip()) for p in x.split(',') if p.strip() and int(p.strip()) > 0],
+        "format": lambda x: ", ".join(f"#{i}" for i in x) if x else "Все доступные",
+        "help": "К этим Inbound в 3X-UI будет привязан ключ. В подписке пользователя появятся конфиги каждого из них."
     },
 ]
 

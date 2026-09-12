@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import logging
 import secrets
@@ -55,6 +56,10 @@ def normalize_tariff_money(row: Dict[str, Any], *, base_currency: str, rub_rate:
     if base_currency != 'RUB':
         rub_major *= rub_rate
     data['price_rub'] = float(rub_major) if rub_major % 1 else int(rub_major)
+    # Если tariff возвращается как dict:
+    if "inbound_ids" in data:
+        raw = data["inbound_ids"]
+        data["inbound_ids"] = json.loads(raw) if raw else []
     return data
 
 def get_all_tariffs(
@@ -81,7 +86,7 @@ def get_all_tariffs(
         cursor = conn.execute(f"""
             SELECT id, name, duration_days, price_minor,
                    display_order, is_active, traffic_limit_gb, group_id, max_ips,
-                   system_type
+                   system_type, inbound_ids
             FROM tariffs
             {where_clause}
             ORDER BY display_order, id
@@ -103,7 +108,7 @@ def get_tariff_by_id(tariff_id: int) -> Optional[Dict[str, Any]]:
         cursor = conn.execute("""
             SELECT id, name, duration_days, price_minor,
                    display_order, is_active, traffic_limit_gb, group_id, max_ips,
-                   system_type
+                   system_type, inbound_ids
             FROM tariffs
             WHERE id = ?
         """, (tariff_id,))
@@ -119,6 +124,7 @@ def add_tariff(
     price_rub: int | float | None = None,
     display_order: int = 0,
     traffic_limit_gb: int = 0,
+    inbound_ids: list[int] | str | None = None,
     group_id: int = 1,
     max_ips: int = 1,
     price_minor: int | None = None,
@@ -142,6 +148,12 @@ def add_tariff(
     duration_days = int(duration_days)
     traffic_limit_gb = int(traffic_limit_gb)
     max_ips = int(max_ips)
+    if isinstance(inbound_ids, list):
+        serialized_inbounds = json.dumps(inbound_ids)
+    elif isinstance(inbound_ids, str):
+        serialized_inbounds = inbound_ids
+    else:
+        serialized_inbounds = "[]"
     if not 0 <= duration_days <= 99999:
         raise ValueError("duration_days must be between 0 and 99999")
     if not 0 <= traffic_limit_gb <= 99999:
@@ -160,9 +172,9 @@ def add_tariff(
             resolved_minor = max(0, int(price_minor))
         cursor = conn.execute("""
             INSERT INTO tariffs (name, duration_days, price_minor,
-                                display_order, is_active, traffic_limit_gb, group_id, max_ips)
-            VALUES (?, ?, ?, ?, 1, ?, ?, ?)
-        """, (name, duration_days, resolved_minor, display_order, traffic_limit_gb, group_id, max_ips))
+                                display_order, is_active, traffic_limit_gb, inbound_ids, group_id, max_ips)
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+        """, (name, duration_days, resolved_minor, display_order, traffic_limit_gb, serialized_inbounds, group_id, max_ips))
         tariff_id = cursor.lastrowid
         logger.info(f"Добавлен тариф: {name} (ID: {tariff_id}, трафик: {traffic_limit_gb} ГБ, группа: {group_id}, max_ips: {max_ips})")
         return tariff_id
@@ -179,7 +191,7 @@ def update_tariff(tariff_id: int, **fields) -> bool:
         True if update is successful
     """
     allowed_fields = {'name', 'duration_days', 'price_rub', 'price_minor',
-                      'display_order', 'is_active', 'group_id', 'traffic_limit_gb', 'max_ips'}
+                      'display_order', 'is_active', 'group_id', 'traffic_limit_gb', 'max_ips', 'inbound_ids'}
     fields = {k: v for k, v in fields.items() if k in allowed_fields}
     
     if not fields:
@@ -292,7 +304,7 @@ def _get_admin_custom_tariff_with_conn(
         """
         SELECT id, name, duration_days, price_minor,
                display_order, is_active, traffic_limit_gb, group_id, max_ips,
-               system_type
+               system_type, inbound_ids
         FROM tariffs
         WHERE group_id = ? AND system_type = ?
         LIMIT 1

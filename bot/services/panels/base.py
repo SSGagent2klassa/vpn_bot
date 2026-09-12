@@ -147,6 +147,7 @@ class PanelClientState:
     enable: bool = True
     sub_id: str = ""
     limit_ip: int = 1
+    limit_hwid: int = 0
     reset: int = 0
     details_complete: bool = True
 

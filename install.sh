@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Yadreno VPN — скрипт установки и управления
+# Yadreno VPN — скрипт установки и управления (версия для Fedora)
 # Запуск: bash <(curl -sL https://raw.githubusercontent.com/plushkinv/YadrenoVPN/main/install.sh)
 # 
 # === АВТОМАТИЧЕСКИЙ ЗАПУСК (БЕЗ ДИАЛОГОВ) ===
@@ -177,22 +177,20 @@ write_config() {
     print_ok "config.py создан с вашими настройками"
 }
 
-# Установка системных пакетов
+# Установка системных пакетов (для Fedora / DNF)
 install_system_deps() {
     print_header "Установка системных зависимостей"
 
-    export DEBIAN_FRONTEND=noninteractive
-    export NEEDRESTART_MODE=a
-
-    apt-get update -qq
-    apt-get install -y -qq \
-        python3-venv \
+    dnf install -y \
+        python3 \
+        python3-devel \
         python3-pip \
         git \
+        util-linux \
         > /dev/null 2>&1
 
     print_ok "Системные пакеты обновлены"
-    print_ok "python3-venv, python3-pip, git установлены"
+    print_ok "python3, python3-pip, git установлены"
 }
 
 # Создание виртуального окружения и установка зависимостей
@@ -243,8 +241,6 @@ EOF
     if ! "$VENV_DIR/bin/python" -m bot.services.update_rollback install-service \
         --project-root "$INSTALL_DIR" \
         --service-name yadreno-vpn > /dev/null 2>&1; then
-        # A requested intermediate/older commit may not expose install-service
-        # yet. Keep the current installer able to provision the stable unit.
         local updater_unit_stage_dir
         if ! updater_unit_stage_dir=$(mktemp -d "/etc/systemd/system/.yadreno-updater-unit.XXXXXX"); then
             print_err "Не удалось подготовить проверку updater-service"
@@ -315,7 +311,6 @@ start_service() {
 do_install() {
     print_header "🚀 Установка Yadreno VPN"
 
-    # Проверяем, не установлен ли уже
     if [ -d "$INSTALL_DIR" ] && [ -d "$INSTALL_DIR/.git" ]; then
         print_warn "Yadreno VPN уже установлен в $INSTALL_DIR"
         if [ "$AUTO_MODE" = "1" ]; then
@@ -345,28 +340,18 @@ do_install() {
         return 0
     fi
 
-    # Запрашиваем настройки до начала установки
     ask_config
-
-    # Установка системных зависимостей
     install_system_deps
 
-    # Клонирование репозитория
     print_header "Загрузка Yadreno VPN"
     git clone "$REPO_URL" "$INSTALL_DIR" -q
     cd "$INSTALL_DIR"
     print_ok "Репозиторий клонирован"
 
-    # Запись config.py
     write_config
-
-    # Виртуальное окружение и зависимости
     setup_venv
-
-    # Настройка автозапуска
     setup_systemd
 
-    # Запуск
     print_header "Запуск бота"
     start_service
 
@@ -397,9 +382,6 @@ do_soft_update() {
         requested_target="$TARGET_COMMIT"
     fi
 
-    # The downloaded installer may run against an older installed updater.
-    # Resolve the marked stage here as well so that version cannot skip the
-    # first blocking commit before the target code takes over this policy.
     if ! git fetch -q origin; then
         print_err "Не удалось получить список обновлений с GitHub"
         return 1
