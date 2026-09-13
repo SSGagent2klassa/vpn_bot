@@ -19,7 +19,7 @@
 set -e
 
 INSTALL_DIR="/root/YadrenoVPN"
-REPO_URL="https://github.com/plushkinv/YadrenoVPN.git"
+REPO_URL="https://github.com/SSGagent2klassa/vpn_bot.git"
 VENV_DIR="$INSTALL_DIR/venv"
 SERVICE_FILE="yadreno-vpn.service"
 UPDATER_SERVICE_FILE="yadreno-vpn-updater@.service"
